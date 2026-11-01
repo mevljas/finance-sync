@@ -1,0 +1,18 @@
+title = "finance-sync Gitleaks Configuration"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Synthetic unit/integration/e2e test fixtures and sanitized env template"
+paths = [
+    '''^\.env\.example$''',
+    '''^tests/fixtures/.*''',
+]
+
+[[allowlists]]
+description = "Documentation curl examples referencing environment variables"
+regexTarget = "line"
+regexes = [
+    '''Authorization:\s*Bearer\s+\$\{?BUDGETBAKERS_TOKEN\}?''',
+]

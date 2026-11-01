@@ -1,0 +1,82 @@
+# ==============================================================================
+# Portainer Homelab Stack — finance-sync
+# Deploy in Portainer -> Stacks -> Add Stack -> Upload/Repository
+# Configure secrets in Portainer's "Environment variables" UI section.
+# ==============================================================================
+
+services:
+  ibkr_worker:
+    image: ${FINANCE_SYNC_IMAGE:-ghcr.io/mevljas/finance-sync:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: finance-sync-ibkr
+    restart: unless-stopped
+    pull_policy: always
+    command: ["python", "-m", "ibkr_worker.worker"]
+    environment:
+      USE_MOCK_DATA: ${USE_MOCK_DATA:-false}
+      DRY_RUN: ${DRY_RUN:-false}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SQLITE_DB_PATH: /app/data/finance_sync.db
+      BUDGETBAKERS_BASE_URL: ${BUDGETBAKERS_BASE_URL:-https://rest.budgetbakers.com/wallet}
+      BUDGETBAKERS_TOKEN: ${BUDGETBAKERS_TOKEN:?BUDGETBAKERS_TOKEN is required}
+      BB_IBKR_ACCOUNT_ID: ${BB_IBKR_ACCOUNT_ID:?BB_IBKR_ACCOUNT_ID is required}
+      BB_CATEGORY_INVESTMENTS: ${BB_CATEGORY_INVESTMENTS:-5c5c232a-005a-8000-8000-000000000000}
+      BB_CATEGORY_INTEREST_DIVIDENDS: ${BB_CATEGORY_INTEREST_DIVIDENDS:-5c5c2711-0064-8000-8000-000000000000}
+      IBKR_FLEX_TOKEN: ${IBKR_FLEX_TOKEN:?IBKR_FLEX_TOKEN is required}
+      IBKR_FLEX_QUERY_ID: ${IBKR_FLEX_QUERY_ID:?IBKR_FLEX_QUERY_ID is required}
+      IBKR_POLL_INTERVAL_SECONDS: ${IBKR_POLL_INTERVAL_SECONDS:-21600}
+      IBKR_FLEX_WAIT_SECONDS: ${IBKR_FLEX_WAIT_SECONDS:-10}
+    volumes:
+      - finance_sync_data:/app/data
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  tr_worker:
+    image: ${FINANCE_SYNC_IMAGE:-ghcr.io/mevljas/finance-sync:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: finance-sync-tr
+    restart: unless-stopped
+    pull_policy: always
+    command: ["python", "-m", "tr_worker.worker"]
+    environment:
+      USE_MOCK_DATA: ${USE_MOCK_DATA:-false}
+      DRY_RUN: ${DRY_RUN:-false}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SQLITE_DB_PATH: /app/data/finance_sync.db
+      BUDGETBAKERS_BASE_URL: ${BUDGETBAKERS_BASE_URL:-https://rest.budgetbakers.com/wallet}
+      BUDGETBAKERS_TOKEN: ${BUDGETBAKERS_TOKEN:?BUDGETBAKERS_TOKEN is required}
+      BB_TR_CASH_ACCOUNT_ID: ${BB_TR_CASH_ACCOUNT_ID:?BB_TR_CASH_ACCOUNT_ID is required}
+      BB_TR_WEALTH_ACCOUNT_ID: ${BB_TR_WEALTH_ACCOUNT_ID:?BB_TR_WEALTH_ACCOUNT_ID is required}
+      BB_CATEGORY_INVESTMENTS: ${BB_CATEGORY_INVESTMENTS:-5c5c232a-005a-8000-8000-000000000000}
+      BB_CATEGORY_INTEREST_DIVIDENDS: ${BB_CATEGORY_INTEREST_DIVIDENDS:-5c5c2711-0064-8000-8000-000000000000}
+      BB_CATEGORY_TRANSFER: ${BB_CATEGORY_TRANSFER:-5c5c4e21-00c8-8000-8000-000000000000}
+      BB_CATEGORY_UNKNOWN_EXPENSE: ${BB_CATEGORY_UNKNOWN_EXPENSE:-5c5c32c9-0082-8000-8000-000000000000}
+      TR_PHONE_NO: ${TR_PHONE_NO:?TR_PHONE_NO is required}
+      TR_PIN: ${TR_PIN:?TR_PIN is required}
+      TR_SESSION_DIR: /app/data
+      TR_POLL_INTERVAL_SECONDS: ${TR_POLL_INTERVAL_SECONDS:-900}
+      TR_CARD_CUTOFF_DATE: ${TR_CARD_CUTOFF_DATE:-2026-11-01T09:00:00Z}
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:?DISCORD_BOT_TOKEN is required}
+      DISCORD_CHANNEL_ID: ${DISCORD_CHANNEL_ID:?DISCORD_CHANNEL_ID is required}
+      DISCORD_2FA_TIMEOUT_SECONDS: ${DISCORD_2FA_TIMEOUT_SECONDS:-300}
+      DISCORD_2FA_POLL_INTERVAL_SECONDS: ${DISCORD_2FA_POLL_INTERVAL_SECONDS:-3}
+    volumes:
+      - finance_sync_data:/app/data
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+volumes:
+  finance_sync_data:
+    driver: local

@@ -1,0 +1,129 @@
+[
+  {
+    "id": "tr-card-1001",
+    "timestamp": "2026-11-01T12:00:00.000Z",
+    "eventType": "card_successful_transaction",
+    "title": "ACME SUPERMARKET",
+    "subtitle": "Card payment",
+    "status": "EXECUTED",
+    "amount": {
+      "value": -25.00,
+      "currency": "EUR"
+    },
+    "mcc": "5411"
+  },
+  {
+    "id": "tr-card-old-0999",
+    "timestamp": "2026-10-28T12:00:00.000Z",
+    "eventType": "card_successful_transaction",
+    "title": "ACME SUPERMARKET",
+    "subtitle": "Card payment",
+    "status": "EXECUTED",
+    "amount": {
+      "value": -15.00,
+      "currency": "EUR"
+    },
+    "mcc": "5411"
+  },
+  {
+    "id": "tr-card-1002",
+    "timestamp": "2026-11-01T13:00:00.000Z",
+    "eventType": "card_successful_transaction",
+    "title": "FAKE BURGER DINER",
+    "subtitle": "Card payment",
+    "status": "EXECUTED",
+    "amount": {
+      "value": -10.00,
+      "currency": "EUR"
+    },
+    "mcc": "5812"
+  },
+  {
+    "id": "tr-int-2026-11",
+    "timestamp": "2026-11-01T08:00:00.000Z",
+    "eventType": "INTEREST_PAYOUT_CREATED",
+    "title": "Interest",
+    "subtitle": "2.00% p.a.",
+    "status": "EXECUTED",
+    "amount": {
+      "value": 100.00,
+      "currency": "EUR"
+    }
+  },
+  {
+    "id": "tr-int-2026-04",
+    "timestamp": "2026-04-01T08:00:00.000Z",
+    "eventType": "INTEREST_PAYOUT_CREATED",
+    "title": "Interest",
+    "subtitle": "2.00% p.a.",
+    "status": "EXECUTED",
+    "amount": {
+      "value": 80.00,
+      "currency": "EUR"
+    }
+  },
+  {
+    "id": "tr-saveback-2026-11",
+    "timestamp": "2026-11-01T10:00:00.000Z",
+    "eventType": "benefits_saveback_execution",
+    "title": "Saveback",
+    "subtitle": "1% Saveback bonus invested",
+    "status": "EXECUTED",
+    "amount": {
+      "value": 15.00,
+      "currency": "EUR"
+    },
+    "details": {
+      "isin": "XF0000000001",
+      "symbol": "FAKE",
+      "shares": 0.1500,
+      "price": 100.00
+    }
+  },
+  {
+    "id": "tr-sparplan-2026-10",
+    "timestamp": "2026-10-16T10:00:00.000Z",
+    "eventType": "SAVINGS_PLAN_EXECUTED",
+    "title": "Fake Global Index ETF (Acc)",
+    "subtitle": "Savings plan executed",
+    "status": "EXECUTED",
+    "amount": {
+      "value": -50.00,
+      "currency": "EUR"
+    },
+    "details": {
+      "isin": "XF0000000001",
+      "symbol": "FAKE",
+      "shares": 0.5000,
+      "price": 100.00
+    }
+  },
+  {
+    "id": "tr-div-2026-10",
+    "timestamp": "2026-10-25T08:00:00.000Z",
+    "eventType": "CREDIT",
+    "title": "Fake Dividend Corp",
+    "subtitle": "Cash Dividend",
+    "status": "EXECUTED",
+    "amount": {
+      "value": 10.00,
+      "currency": "EUR"
+    },
+    "details": {
+      "isin": "XF0000000002",
+      "symbol": "FDIV"
+    }
+  },
+  {
+    "id": "tr-sepa-2026-11",
+    "timestamp": "2026-11-01T11:00:00.000Z",
+    "eventType": "INCOMING_TRANSFER",
+    "title": "Jane Doe",
+    "subtitle": "SEPA Deposit",
+    "status": "EXECUTED",
+    "amount": {
+      "value": 500.00,
+      "currency": "EUR"
+    }
+  }
+]

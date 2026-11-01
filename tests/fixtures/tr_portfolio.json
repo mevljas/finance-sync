@@ -1,0 +1,14 @@
+{
+  "netValue": 1000.00,
+  "currency": "EUR",
+  "positions": [
+    {
+      "isin": "XF0000000001",
+      "name": "Fake Global Index ETF (Acc)",
+      "netSize": "10.0000",
+      "averageBuyIn": "90.00",
+      "currentPrice": "100.00",
+      "marketValue": 1000.00
+    }
+  ]
+}

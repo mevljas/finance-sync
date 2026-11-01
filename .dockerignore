@@ -1,0 +1,34 @@
+# Git & CI
+.git
+.gitignore
+.github
+
+# Secrets & Local Runtime Data
+.env
+.env.*
+data
+*.db
+*.db-shm
+*.db-wal
+*cookies*.txt
+*session*.json
+
+# Virtual environments & caches
+.venv
+venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+
+# Tests, Docs, and Agent Customizations (excluded from production runtime image)
+tests
+docs
+.agents
+AGENTS.md
+CLAUDE.md
+README.md
+docker-compose.yml
