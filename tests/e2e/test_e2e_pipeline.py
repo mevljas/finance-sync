@@ -220,3 +220,73 @@ def test_full_e2e_pipeline_both_workers(
         == tr_cash_count_before
     )
     get_settings.cache_clear()
+
+
+@respx.mock
+def test_e2e_cli_dry_run_flags_and_json_report_export(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify --dry-run and --dry-run-output CLI flags write JSON reports without mutating state."""
+    ibkr_acc = "00000000-0000-0000-0000-000000000001"
+    tr_cash_acc = "00000000-0000-0000-0000-000000000002"
+    tr_wealth_acc = "00000000-0000-0000-0000-000000000003"
+    db_file = tmp_path / "dry_run_e2e.db"
+    ibkr_report_file = tmp_path / "ibkr_dry_run.json"
+    tr_report_file = tmp_path / "tr_dry_run.json"
+
+    monkeypatch.setenv("USE_MOCK_DATA", "true")
+    monkeypatch.setenv("DRY_RUN", "false")
+    monkeypatch.setenv("SQLITE_DB_PATH", str(db_file))
+    monkeypatch.setenv("BUDGETBAKERS_TOKEN", "e2e-jwt-token")
+    monkeypatch.setenv("BB_IBKR_ACCOUNT_ID", ibkr_acc)
+    monkeypatch.setenv("BB_TR_CASH_ACCOUNT_ID", tr_cash_acc)
+    monkeypatch.setenv("BB_TR_WEALTH_ACCOUNT_ID", tr_wealth_acc)
+    monkeypatch.setenv("TR_SESSION_DIR", str(tmp_path / "tr_sess"))
+    get_settings.cache_clear()
+
+    wallet = StatefulWalletMock(ibkr_acc, tr_cash_acc, tr_wealth_acc)
+    respx.get("https://rest.budgetbakers.com/wallet/v1/api/accounts").mock(
+        side_effect=wallet.handle_get_accounts
+    )
+    respx.patch("https://rest.budgetbakers.com/wallet/v1/api/accounts").mock(
+        side_effect=wallet.handle_patch_accounts
+    )
+    respx.get("https://rest.budgetbakers.com/wallet/v1/api/records").mock(
+        side_effect=wallet.handle_get_records
+    )
+    respx.post("https://rest.budgetbakers.com/wallet/v1/api/records").mock(
+        side_effect=wallet.handle_post_records
+    )
+    respx.delete("https://rest.budgetbakers.com/wallet/v1/api/records").mock(
+        side_effect=wallet.handle_delete_records
+    )
+
+    assert ibkr_main(["--once", "--dry-run", "--dry-run-output", str(ibkr_report_file)]) == 0
+    assert tr_main(["--once", "--dry-run", "--dry-run-output", str(tr_report_file)]) == 0
+
+    assert ibkr_report_file.exists()
+    assert tr_report_file.exists()
+
+    ibkr_report = json.loads(ibkr_report_file.read_text(encoding="utf-8"))
+    assert ibkr_report["broker"] == "ibkr"
+    assert ibkr_report["dry_run"] is True
+    assert ibkr_report["summary"]["trades_synced"] == 2
+    assert ibkr_report["summary"]["cash_events_synced"] == 1
+    assert len(ibkr_report["would_create_records"]) == 3
+    assert len(ibkr_report["would_patch_accounts"]) == 1
+
+    tr_report = json.loads(tr_report_file.read_text(encoding="utf-8"))
+    assert tr_report["broker"] == "tr"
+    assert tr_report["dry_run"] is True
+    assert tr_report["summary"]["deleted_legacy_savings"] == 1
+    assert tr_report["summary"]["records_created"] == 8
+    assert tr_report["summary"]["skipped_duplicates"] == 1
+    assert tr_report["would_delete_record_ids"] == ["manual-sav-1"]
+    assert len(tr_report["would_create_records"]) == 8
+
+    # Verify Wallet state was not mutated by dry-run CLI executions
+    assert wallet.compute_account_view(ibkr_acc)["recordStats"]["recordCount"] == 1
+    assert wallet.compute_account_view(tr_cash_acc)["recordStats"]["recordCount"] == 2
+    assert wallet.compute_account_view(tr_wealth_acc)["recordStats"]["recordCount"] == 0
+    get_settings.cache_clear()

@@ -16,6 +16,7 @@ Before modifying code, consult these source-of-truth documents in `docs/`:
   - [`0002-budgetbakers-initial-balance-patching.md`](./docs/adr/0002-budgetbakers-initial-balance-patching.md)
   - [`0003-discord-bot-2fa-renewal.md`](./docs/adr/0003-discord-bot-2fa-renewal.md)
   - [`0004-gitleaks-secret-scanning-and-test-fixtures.md`](./docs/adr/0004-gitleaks-secret-scanning-and-test-fixtures.md)
+  - [`0005-read-only-dry-run-mode.md`](./docs/adr/0005-read-only-dry-run-mode.md)
 
 ---
 
@@ -67,8 +68,10 @@ uv run mypy .
 uv run pytest --cov=config --cov=shared --cov=ibkr_worker --cov=tr_worker -v
 
 # Run workers locally in mock/dry-run mode
-USE_MOCK_DATA=true DRY_RUN=true uv run python -m ibkr_worker.worker --once
-USE_MOCK_DATA=true DRY_RUN=true uv run python -m tr_worker.worker --once
+USE_MOCK_DATA=true uv run python -m ibkr_worker.worker --once --dry-run
+USE_MOCK_DATA=true uv run python -m tr_worker.worker --once --dry-run
+USE_MOCK_DATA=true uv run python -m ibkr_worker.worker --once --dry-run --dry-run-output ibkr_preview.json
+USE_MOCK_DATA=true uv run python -m tr_worker.worker --once --dry-run --dry-run-output tr_preview.json
 ```
 
 ---

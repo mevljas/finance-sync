@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from config.settings import Settings, get_settings
@@ -38,6 +40,7 @@ class TRSyncSummary:
     skipped_duplicates: int
     deleted_legacy_savings: int
     patched_wealth_initial_balance: float | None
+    dry_run: bool = False
 
 
 def _parse_iso(ts: str) -> datetime:
@@ -89,10 +92,12 @@ class TRWorker:
     def _reconcile_backfill(
         self,
         parsed_records: list[ParsedTRRecord],
-    ) -> int:
+        *,
+        is_dry_run: bool = False,
+    ) -> tuple[int, set[str]]:
         """Delete manual -50 EUR savings plans once and seed existing manual interest."""
         if self.db.get_metadata(BACKFILL_META_KEY) == "true":
-            return 0
+            return 0, set()
 
         logger.info("Running one-time Trade Republic historical backfill reconciliation...")
         # 1. Find and delete manual -50 EUR "Savings plan" placeholder records on TR cash account
@@ -121,6 +126,7 @@ class TRWorker:
             record_date_gte="2024-01-01T00:00:00Z",
         )
         seed_entries: list[SeenRecordEntry] = []
+        seeded_hashes: set[str] = set()
         for candidate in parsed_records:
             if candidate.kind != TRRecordKind.INTEREST:
                 continue
@@ -145,7 +151,17 @@ class TRWorker:
                             timestamp=candidate.timestamp,
                         )
                     )
+                    seeded_hashes.add(rec_hash)
                     break
+
+        if is_dry_run:
+            logger.info(
+                "[DRY_RUN] Would seed %d existing manual Trade Republic interest records "
+                "and set %s=true in SQLite",
+                len(seed_entries),
+                BACKFILL_META_KEY,
+            )
+            return deleted_count, seeded_hashes
 
         if seed_entries:
             self.db.mark_seen_batch(seed_entries)
@@ -155,14 +171,18 @@ class TRWorker:
             )
 
         self.db.set_metadata(BACKFILL_META_KEY, "true")
-        return deleted_count
+        return deleted_count, seeded_hashes
 
     def sync_once(self) -> TRSyncSummary:
         """Run a single Trade Republic sync and portfolio balance update cycle."""
+        is_dry_run = self.settings.dry_run or self.bb_client.dry_run
         raw_events, raw_portfolio = self.session_manager.fetch_timeline_and_portfolio()
         parsed_records = parse_tr_timeline_events(raw_events, self.settings)
 
-        deleted_legacy = self._reconcile_backfill(parsed_records)
+        deleted_legacy, ephemeral_seeded_hashes = self._reconcile_backfill(
+            parsed_records,
+            is_dry_run=is_dry_run,
+        )
 
         records_to_create: list[CreateRecordPayload] = []
         seen_entries: list[SeenRecordEntry] = []
@@ -175,7 +195,7 @@ class TRWorker:
                 item.timestamp,
                 item.amount,
             )
-            if self.db.is_seen(rec_hash):
+            if self.db.is_seen(rec_hash) or rec_hash in ephemeral_seeded_hashes:
                 skipped_duplicates += 1
                 continue
 
@@ -192,7 +212,14 @@ class TRWorker:
             rec_batch = records_to_create[start : start + MAX_RECORDS_BATCH_SIZE]
             seen_batch = seen_entries[start : start + MAX_RECORDS_BATCH_SIZE]
             self.bb_client.create_records(rec_batch)
-            self.db.mark_seen_batch(seen_batch)
+            if not is_dry_run:
+                self.db.mark_seen_batch(seen_batch)
+
+        if is_dry_run and seen_entries:
+            logger.info(
+                "[DRY_RUN] Skipping SQLite seen_records persistence for %d TR records",
+                len(seen_entries),
+            )
 
         portfolio_value = parse_tr_portfolio_value(raw_portfolio)
         patched_initial: float | None = None
@@ -203,7 +230,9 @@ class TRWorker:
             )
 
         logger.info(
-            "TR sync complete: created=%d, duplicates=%d, deleted_legacy=%d, patched_wealth=%s",
+            "TR sync complete (dry_run=%s): created=%d, duplicates=%d, "
+            "deleted_legacy=%d, patched_wealth=%s",
+            is_dry_run,
             len(records_to_create),
             skipped_duplicates,
             deleted_legacy,
@@ -214,6 +243,7 @@ class TRWorker:
             skipped_duplicates=skipped_duplicates,
             deleted_legacy_savings=deleted_legacy,
             patched_wealth_initial_balance=patched_initial,
+            dry_run=is_dry_run,
         )
 
     def run_forever(self) -> None:
@@ -234,9 +264,23 @@ def main(argv: list[str] | None = None) -> int:
     """CLI entrypoint for tr_worker."""
     parser = argparse.ArgumentParser(description="Trade Republic to BudgetBakers sync worker")
     parser.add_argument("--once", action="store_true", help="Run a single sync cycle and exit")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview sync without writing to BudgetBakers or SQLite",
+    )
+    parser.add_argument(
+        "--dry-run-output",
+        type=Path,
+        default=None,
+        help="Write JSON dry-run preview report to file (implies --dry-run)",
+    )
     args = parser.parse_args(argv)
 
     settings = get_settings()
+    if args.dry_run or args.dry_run_output is not None:
+        settings = settings.model_copy(update={"dry_run": True})
+
     logging.basicConfig(
         level=getattr(logging, settings.log_level.upper(), logging.INFO),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -246,11 +290,33 @@ def main(argv: list[str] | None = None) -> int:
         token=settings.budgetbakers_token.get_secret_value(),
         base_url=settings.budgetbakers_base_url,
         dry_run=settings.dry_run,
+        use_mock_data=settings.use_mock_data,
     ) as bb_client:
         worker = TRWorker(settings=settings, db=db, bb_client=bb_client)
         try:
-            if args.once:
-                worker.sync_once()
+            if args.once or args.dry_run_output is not None:
+                summary = worker.sync_once()
+                if args.dry_run_output is not None:
+                    report: dict[str, Any] = {
+                        "broker": TRWorker.BROKER_NAME,
+                        "dry_run": summary.dry_run,
+                        "summary": {
+                            "records_created": summary.records_created,
+                            "skipped_duplicates": summary.skipped_duplicates,
+                            "deleted_legacy_savings": summary.deleted_legacy_savings,
+                            "patched_wealth_initial_balance": (
+                                summary.patched_wealth_initial_balance
+                            ),
+                        },
+                        "would_delete_record_ids": bb_client.dry_run_deleted_ids,
+                        "would_create_records": bb_client.dry_run_created,
+                        "would_patch_accounts": bb_client.dry_run_patched_accounts,
+                    }
+                    args.dry_run_output.parent.mkdir(parents=True, exist_ok=True)
+                    args.dry_run_output.write_text(
+                        json.dumps(report, indent=2),
+                        encoding="utf-8",
+                    )
             else:
                 worker.run_forever()
         finally:

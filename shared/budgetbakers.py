@@ -83,6 +83,7 @@ class BudgetBakersClient:
         base_url: str = "https://rest.budgetbakers.com/wallet",
         *,
         dry_run: bool = False,
+        use_mock_data: bool = False,
         timeout: float = 20.0,
         http_client: httpx.Client | None = None,
         sleep_fn: Callable[[float], None] = time.sleep,
@@ -90,8 +91,12 @@ class BudgetBakersClient:
         self.base_url = base_url.rstrip("/")
         self.api_prefix = f"{self.base_url}/v1/api"
         self.dry_run = dry_run
+        self.use_mock_data = use_mock_data
         self._sleep = sleep_fn
         self._owns_client = http_client is None
+        self.dry_run_created: list[dict[str, Any]] = []
+        self.dry_run_deleted_ids: list[str] = []
+        self.dry_run_patched_accounts: list[dict[str, Any]] = []
         self._client = http_client or httpx.Client(
             timeout=timeout,
             headers={
@@ -147,6 +152,16 @@ class BudgetBakersClient:
             return []
         if self.dry_run:
             logger.info("[DRY_RUN] Would create %d BudgetBakers records", len(records))
+            for rec in records:
+                logger.info(
+                    "[DRY_RUN] Would create record: account=%s amount=%.2f %s date=%s note=%s",
+                    rec.account_id,
+                    rec.amount.value,
+                    rec.amount.currency_code,
+                    rec.record_date,
+                    rec.note or "",
+                )
+                self.dry_run_created.append(rec.to_api_dict())
             return [f"dry-run-{idx}" for idx in range(len(records))]
 
         created_ids: list[str] = []
@@ -164,16 +179,29 @@ class BudgetBakersClient:
 
     def get_account(self, account_id: str) -> dict[str, Any]:
         """Fetch a single account's details from GET /v1/api/accounts."""
-        if self.dry_run:
-            return {
-                "id": account_id,
-                "recordStats": {"totalIncomes": 0.0, "totalExpenses": 0.0},
-            }
+        fallback_stub: dict[str, Any] = {
+            "id": account_id,
+            "recordStats": {"totalIncomes": 0.0, "totalExpenses": 0.0},
+        }
+        if self.dry_run and self.use_mock_data:
+            try:
+                data_try: dict[str, Any] = self._request(
+                    "GET", "/accounts", params={"id": account_id}
+                )
+                for acc in data_try.get("accounts", []):
+                    if acc.get("id") == account_id:
+                        return dict(acc)
+            except (httpx.HTTPError, BudgetBakersAPIError):
+                return fallback_stub
+            return fallback_stub
+
         data: dict[str, Any] = self._request("GET", "/accounts", params={"id": account_id})
         accounts: list[dict[str, Any]] = data.get("accounts", [])
         for acc in accounts:
             if acc.get("id") == account_id:
                 return acc
+        if self.dry_run:
+            return fallback_stub
         raise BudgetBakersAPIError(404, f"Account {account_id} not found")
 
     def patch_account_initial_balance(
@@ -189,6 +217,7 @@ class BudgetBakersClient:
                 account_id,
                 rounded,
             )
+            self.dry_run_patched_accounts.append({"id": account_id, "initialBalance": rounded})
             return {"id": account_id, "initialBalance": rounded, "dryRun": True}
 
         payload = [{"id": account_id, "initialBalance": rounded}]
@@ -222,8 +251,6 @@ class BudgetBakersClient:
         limit: int = 200,
     ) -> list[dict[str, Any]]:
         """Query existing records via GET /v1/api/records."""
-        if self.dry_run:
-            return []
         params: dict[str, Any] = {
             "accountId": account_id,
             "limit": min(max(limit, 1), 200),
@@ -232,6 +259,15 @@ class BudgetBakersClient:
             params["categoryId"] = category_id
         if record_date_gte:
             params["recordDate"] = f"gte.{record_date_gte}"
+
+        if self.dry_run and self.use_mock_data:
+            try:
+                data_try: dict[str, Any] = self._request("GET", "/records", params=params)
+                recs_try: list[dict[str, Any]] = data_try.get("records", [])
+                return recs_try
+            except (httpx.HTTPError, BudgetBakersAPIError):
+                return []
+
         data: dict[str, Any] = self._request("GET", "/records", params=params)
         records: list[dict[str, Any]] = data.get("records", [])
         return records
@@ -241,7 +277,12 @@ class BudgetBakersClient:
         if not record_ids:
             return 0
         if self.dry_run:
-            logger.info("[DRY_RUN] Would delete %d BudgetBakers records", len(record_ids))
+            logger.info(
+                "[DRY_RUN] Would delete %d BudgetBakers records: %s",
+                len(record_ids),
+                list(record_ids),
+            )
+            self.dry_run_deleted_ids.extend(str(rid) for rid in record_ids)
             return len(record_ids)
 
         deleted_count = 0

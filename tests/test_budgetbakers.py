@@ -205,26 +205,87 @@ def test_budgetbakers_delete_records_and_rate_limit_retry() -> None:
 
 @respx.mock
 def test_budgetbakers_dry_run_and_error_handling() -> None:
-    """Verify dry_run mode performs no writes and HTTP 4xx raises BudgetBakersAPIError."""
-    with BudgetBakersClient(token="jwt-token", dry_run=True) as dry_client:
+    """Verify dry_run mode performs read-only GETs, skips writes, and records dry-run previews."""
+    account_id = "00000000-0000-0000-0000-000000000001"
+    get_acc_route = respx.get("https://rest.budgetbakers.com/wallet/v1/api/accounts").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "accounts": [
+                    {
+                        "id": account_id,
+                        "recordStats": {"totalIncomes": 1000.0, "totalExpenses": 250.0},
+                    }
+                ]
+            },
+        )
+    )
+    get_rec_route = respx.get("https://rest.budgetbakers.com/wallet/v1/api/records").mock(
+        return_value=httpx.Response(
+            200,
+            json={"records": [{"id": "rec-existing-1", "note": "Savings plan"}]},
+        )
+    )
+    post_route = respx.post("https://rest.budgetbakers.com/wallet/v1/api/records").mock(
+        return_value=httpx.Response(500)
+    )
+    patch_route = respx.patch("https://rest.budgetbakers.com/wallet/v1/api/accounts").mock(
+        return_value=httpx.Response(500)
+    )
+    delete_route = respx.delete("https://rest.budgetbakers.com/wallet/v1/api/records").mock(
+        return_value=httpx.Response(500)
+    )
+
+    with BudgetBakersClient(token="jwt-token", dry_run=True, use_mock_data=False) as dry_client:
         res = dry_client.create_records(
             [
                 CreateRecordPayload(
-                    account_id="acc-1",
+                    account_id=account_id,
                     amount=AmountPayload(value=-5.0),
                     category_id="cat-1",
                     record_date="2026-11-01T00:00:00Z",
+                    note="Test dry-run record",
                 )
             ]
         )
         assert res == ["dry-run-0"]
-        patch_res = dry_client.patch_account_initial_balance("acc-1", 100.0)
-        assert patch_res["dryRun"] is True
-        assert dry_client.delete_records(["id-1"]) == 1
+        assert len(dry_client.dry_run_created) == 1
+        assert dry_client.dry_run_created[0]["note"] == "Test dry-run record"
 
+        # Read-only GET /records should execute against the API when use_mock_data=False
+        fetched_recs = dry_client.get_records(account_id)
+        assert len(fetched_recs) == 1
+        assert get_rec_route.call_count == 1
+
+        # update_account_target_balance should call GET /accounts (1000.0 incomes, 250.0 expenses)
+        # target = 5000.0 -> initial = 5000.0 - 1000.0 + 250.0 = 4250.0
+        computed_initial = dry_client.update_account_target_balance(account_id, 5000.0)
+        assert computed_initial == 4250.0
+        assert get_acc_route.call_count == 1
+        assert dry_client.dry_run_patched_accounts == [{"id": account_id, "initialBalance": 4250.0}]
+
+        assert dry_client.delete_records(["id-1", "id-2"]) == 2
+        assert dry_client.dry_run_deleted_ids == ["id-1", "id-2"]
+
+        # Zero mutating HTTP calls made
+        assert post_route.call_count == 0
+        assert patch_route.call_count == 0
+        assert delete_route.call_count == 0
+
+    # Offline mock-data fallback when dry_run=True and use_mock_data=True
     respx.get("https://rest.budgetbakers.com/wallet/v1/api/accounts").mock(
         return_value=httpx.Response(401, text="Unauthorized")
     )
+    respx.get("https://rest.budgetbakers.com/wallet/v1/api/records").mock(
+        return_value=httpx.Response(401, text="Unauthorized")
+    )
+    with BudgetBakersClient(
+        token="mock-budgetbakers-token", dry_run=True, use_mock_data=True
+    ) as offline_client:
+        stub_acc = offline_client.get_account(account_id)
+        assert stub_acc["recordStats"] == {"totalIncomes": 0.0, "totalExpenses": 0.0}
+        assert offline_client.get_records(account_id) == []
+
     with (
         BudgetBakersClient(token="bad-token") as client,
         pytest.raises(BudgetBakersAPIError) as exc_info,

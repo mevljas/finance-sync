@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import time
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 from config.settings import Settings, get_settings
 from shared.budgetbakers import (
@@ -31,6 +34,7 @@ class IBKRSyncSummary:
     cash_events_synced: int
     skipped_duplicates: int
     patched_initial_balance: float | None
+    dry_run: bool = False
 
 
 class IBKRWorker:
@@ -146,11 +150,19 @@ class IBKRWorker:
             )
             cash_events_synced += 1
 
+        is_dry_run = self.settings.dry_run or self.bb_client.dry_run
         for start in range(0, len(records_to_create), MAX_RECORDS_BATCH_SIZE):
             rec_batch = records_to_create[start : start + MAX_RECORDS_BATCH_SIZE]
             seen_batch = seen_entries_to_mark[start : start + MAX_RECORDS_BATCH_SIZE]
             self.bb_client.create_records(rec_batch)
-            self.db.mark_seen_batch(seen_batch)
+            if not is_dry_run:
+                self.db.mark_seen_batch(seen_batch)
+
+        if is_dry_run and seen_entries_to_mark:
+            logger.info(
+                "[DRY_RUN] Skipping SQLite seen_records persistence for %d IBKR records",
+                len(seen_entries_to_mark),
+            )
 
         patched_initial: float | None = None
         if statement.total_portfolio_value > 0:
@@ -160,7 +172,9 @@ class IBKRWorker:
             )
 
         logger.info(
-            "IBKR sync complete: trades=%d, cash_events=%d, duplicates=%d, patched_initial=%s",
+            "IBKR sync complete (dry_run=%s): trades=%d, cash_events=%d, "
+            "duplicates=%d, patched_initial=%s",
+            is_dry_run,
             trades_synced,
             cash_events_synced,
             skipped_duplicates,
@@ -171,6 +185,7 @@ class IBKRWorker:
             cash_events_synced=cash_events_synced,
             skipped_duplicates=skipped_duplicates,
             patched_initial_balance=patched_initial,
+            dry_run=is_dry_run,
         )
 
     def run_forever(self) -> None:
@@ -191,9 +206,23 @@ def main(argv: list[str] | None = None) -> int:
     """CLI entrypoint for ibkr_worker."""
     parser = argparse.ArgumentParser(description="IBKR to BudgetBakers sync worker")
     parser.add_argument("--once", action="store_true", help="Run a single sync cycle and exit")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview sync without writing to BudgetBakers or SQLite",
+    )
+    parser.add_argument(
+        "--dry-run-output",
+        type=Path,
+        default=None,
+        help="Write JSON dry-run preview report to file (implies --dry-run)",
+    )
     args = parser.parse_args(argv)
 
     settings = get_settings()
+    if args.dry_run or args.dry_run_output is not None:
+        settings = settings.model_copy(update={"dry_run": True})
+
     logging.basicConfig(
         level=getattr(logging, settings.log_level.upper(), logging.INFO),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -203,11 +232,30 @@ def main(argv: list[str] | None = None) -> int:
         token=settings.budgetbakers_token.get_secret_value(),
         base_url=settings.budgetbakers_base_url,
         dry_run=settings.dry_run,
+        use_mock_data=settings.use_mock_data,
     ) as bb_client:
         worker = IBKRWorker(settings=settings, db=db, bb_client=bb_client)
         try:
-            if args.once:
-                worker.sync_once()
+            if args.once or args.dry_run_output is not None:
+                summary = worker.sync_once()
+                if args.dry_run_output is not None:
+                    report: dict[str, Any] = {
+                        "broker": IBKRWorker.BROKER_NAME,
+                        "dry_run": summary.dry_run,
+                        "summary": {
+                            "trades_synced": summary.trades_synced,
+                            "cash_events_synced": summary.cash_events_synced,
+                            "skipped_duplicates": summary.skipped_duplicates,
+                            "patched_initial_balance": summary.patched_initial_balance,
+                        },
+                        "would_create_records": bb_client.dry_run_created,
+                        "would_patch_accounts": bb_client.dry_run_patched_accounts,
+                    }
+                    args.dry_run_output.parent.mkdir(parents=True, exist_ok=True)
+                    args.dry_run_output.write_text(
+                        json.dumps(report, indent=2),
+                        encoding="utf-8",
+                    )
             else:
                 worker.run_forever()
         finally:

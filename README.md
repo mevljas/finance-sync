@@ -55,9 +55,10 @@ flowchart LR
 3. **SHA-256 SQLite Deduplication (`shared/database.py`)**:
    - Uses SQLite in WAL mode (`seen_records` table) with deterministic hash:
      `sha256(broker + external_id + timestamp + f"{float(amount):.2f}")`
-4. **First-Class Mock Data & Dry-Run Mode**:
+4. **First-Class Mock Data & Read-Only Dry-Run Mode**:
    - Set `USE_MOCK_DATA=true` to run the entire stack against realistic synthetic IBKR Flex XML and Trade Republic JSON fixtures (`tests/fixtures/`).
-   - Set `DRY_RUN=true` to log all intended BudgetBakers writes without mutating your live Wallet account.
+   - Set `DRY_RUN=true` or pass `--dry-run` to preview all intended BudgetBakers record creations, legacy savings plan deletions, manual interest backfill matches, and `initialBalance` adjustments with **zero mutations** to either BudgetBakers Wallet or the local SQLite deduplication database (`seen_records` / `sync_metadata`).
+   - Pass `--dry-run-output <path.json>` to export a structured JSON preview report of all actions that would be performed.
 
 ---
 
@@ -98,8 +99,13 @@ uv sync --all-groups
 
 ### 2. Run in Mock / Dry-Run Mode (Zero Credentials Needed)
 ```bash
-USE_MOCK_DATA=true DRY_RUN=true uv run python -m ibkr_worker.worker --once
-USE_MOCK_DATA=true DRY_RUN=true uv run python -m tr_worker.worker --once
+# Run a single read-only dry-run sync pass using synthetic fixtures
+USE_MOCK_DATA=true uv run python -m ibkr_worker.worker --once --dry-run
+USE_MOCK_DATA=true uv run python -m tr_worker.worker --once --dry-run
+
+# Export a structured JSON dry-run preview report
+USE_MOCK_DATA=true uv run python -m ibkr_worker.worker --once --dry-run --dry-run-output ibkr_preview.json
+USE_MOCK_DATA=true uv run python -m tr_worker.worker --once --dry-run --dry-run-output tr_preview.json
 ```
 
 ### 3. Run Quality Checks & Full Test Suite
