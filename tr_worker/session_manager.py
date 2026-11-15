@@ -17,7 +17,7 @@ from shared.mock_data import load_mock_tr_portfolio, load_mock_tr_timeline
 logger = logging.getLogger(__name__)
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
-PIN_REGEX = re.compile(r"\b(\d{4})\b")
+PIN_REGEX = re.compile(r"\b(\d{4,6})\b")
 
 
 class TRSessionError(RuntimeError):
@@ -99,14 +99,14 @@ class Discord2FAClient:
         raise TRSessionError("Timed out waiting for 4-digit Trade Republic 2FA PIN in Discord")
 
     def prompt_and_wait_for_pin(self) -> str:
-        """Send 2FA prompt to Discord and return the user's 4-digit verification code."""
+        """Send 2FA prompt to Discord and return the user's 4-to-6-digit verification code."""
         prompt_id = self.send_message(
             "🔐 **Trade Republic 2FA Required**\n"
             "Your Trade Republic session has expired. Please reply in this channel "
-            "with the **4-digit verification code** sent to your Trade Republic app/SMS."
+            "with the **6-digit code from your Authenticator app** (or 4-digit verification code)."
         )
         pin = self.wait_for_pin(prompt_id)
-        self.send_message("✅ Received 4-digit code. Completing Trade Republic authentication...")
+        self.send_message("✅ Received verification code. Submitting to Trade Republic...")
         return pin
 
 
@@ -148,6 +148,7 @@ class TRSessionManager:
             pin=self.pin,
             save_cookies=True,
             cookies_file=str(self.cookies_file),
+            use_v2_login=True,
         )
 
     def has_valid_session(self) -> bool:
@@ -182,10 +183,49 @@ class TRSessionManager:
         if callable(initiate):
             initiate()
 
-        code = self.discord_client.prompt_and_wait_for_pin()
+        needs_auth_code = bool(getattr(self._tr_api, "weblogin_needs_authenticator", True))
+        required_action = getattr(self._tr_api, "_required_action", None)
+        logger.info(
+            "Trade Republic login process initiated (requiredAction=%s, needs_authenticator=%s)",
+            required_action,
+            needs_auth_code,
+        )
         complete = getattr(self._tr_api, "complete_weblogin", None)
-        if callable(complete):
-            complete(code)
+        if needs_auth_code:
+            code = self.discord_client.prompt_and_wait_for_pin()
+            if callable(complete):
+                complete(code)
+            get_proc = getattr(self._tr_api, "_get_weblogin_process", None)
+            await_confirm = getattr(self._tr_api, "_await_weblogin_confirmation", None)
+            save_sess = getattr(self._tr_api, "save_websession", None)
+            if callable(get_proc) and callable(await_confirm):
+                proc = get_proc(quiet=True)
+                logger.info(
+                    "Trade Republic post-authenticator process state: status=%s, requiredAction=%s",
+                    proc.get("status"),
+                    proc.get("requiredAction"),
+                )
+                if proc.get("status") == "PENDING":
+                    self.discord_client.send_message(
+                        "📲 **Step 2: Confirm in Trade Republic App**\n"
+                        "Authenticator code accepted! Please open your "
+                        "**Trade Republic mobile app** and tap **Confirm** to finish logging in."
+                    )
+                    await_confirm()
+                    if callable(save_sess):
+                        save_sess()
+                    self.discord_client.send_message(
+                        "✅ Trade Republic login confirmed in mobile app."
+                    )
+        else:
+            self.discord_client.send_message(
+                "📲 **Trade Republic Login Confirmation Required**\n"
+                "Please open your **Trade Republic mobile app** and tap **Confirm** "
+                "to approve the web login."
+            )
+            if callable(complete):
+                complete()
+            self.discord_client.send_message("✅ Trade Republic login confirmed in mobile app.")
 
         if not self.cookies_file.exists():
             self.cookies_file.write_text("# pytr cookies\n", encoding="utf-8")
@@ -198,25 +238,93 @@ class TRSessionManager:
     async def _fetch_ws_data_async(self, api: Any) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         timeline_events: list[dict[str, Any]] = []
         portfolio_data: dict[str, Any] = {"netValue": 0.0, "positions": []}
+        try:
+            after_cursor: str | None = None
+            for _ in range(25):
+                if after_cursor is None:
+                    await api.timeline_transactions()
+                else:
+                    await api.timeline_transactions(after_cursor)
+                _, _, response = await api.recv()
+                if not isinstance(response, dict):
+                    break
+                items: list[dict[str, Any]] = response.get("items", [])
+                if not items:
+                    break
+                timeline_events.extend(items)
+                cursors: dict[str, Any] = response.get("cursors") or {}
+                after_cursor = cursors.get("after")
+                if not after_cursor:
+                    break
 
-        await api.timeline_transactions()
-        _, _, response = await api.recv()
-        items: list[dict[str, Any]] = (
-            response.get("items", []) if isinstance(response, dict) else []
-        )
-        timeline_events.extend(items)
+            detail_v2_fn = getattr(api, "timeline_detail_v2", None)
+            if callable(detail_v2_fn):
+                for event in timeline_events:
+                    subtitle_l = str(event.get("subtitle") or "").lower()
+                    title_l = str(event.get("title") or "").lower()
+                    ev_type_l = str(event.get("eventType") or "").lower()
+                    combined = f"{ev_type_l} {title_l} {subtitle_l}"
+                    needs_detail = any(
+                        kw in combined
+                        for kw in (
+                            "saveback",
+                            "savings",
+                            "sparplan",
+                            "order",
+                            "buy",
+                            "dividend",
+                        )
+                    )
+                    action: dict[str, Any] = event.get("action") or {}
+                    ev_id = str(event.get("id") or "")
+                    if (
+                        needs_detail
+                        and ev_id
+                        and not event.get("details")
+                        and action.get("type") == "timelineDetail"
+                    ):
+                        await detail_v2_fn(ev_id)
+                        _, _, detail_resp = await api.recv()
+                        if isinstance(detail_resp, dict):
+                            event["details"] = detail_resp
 
-        await api.compact_portfolio()
-        _, _, port_resp = await api.recv()
-        if isinstance(port_resp, dict):
-            positions: list[dict[str, Any]] = port_resp.get("positions", [])
-            net_val = float(port_resp.get("netValue") or 0.0)
-            if net_val == 0.0 and positions:
-                for pos in positions:
-                    net_val += float(pos.get("marketValue") or 0.0)
-            portfolio_data = {"netValue": net_val, "positions": positions}
+            await api.compact_portfolio()
+            _, _, port_resp = await api.recv()
+            if isinstance(port_resp, dict):
+                positions: list[dict[str, Any]] = list(port_resp.get("positions", []))
+                if not positions and "categories" in port_resp:
+                    for cat in port_resp.get("categories", []):
+                        if isinstance(cat, dict):
+                            for pos in cat.get("positions", []):
+                                if isinstance(pos, dict):
+                                    if "isin" in pos and "instrumentId" not in pos:
+                                        pos["instrumentId"] = pos["isin"]
+                                    positions.append(pos)
 
-        return timeline_events, portfolio_data
+                net_val = float(port_resp.get("netValue") or 0.0)
+                if net_val == 0.0 and positions:
+                    has_market_val = any(pos.get("marketValue") is not None for pos in positions)
+                    if not has_market_val and hasattr(api, "instrument_details"):
+                        from pytr.tickers import fetch_instrument_details, fetch_tickers
+
+                        await fetch_instrument_details(api, positions)
+                        await fetch_tickers(api, positions)
+                        for pos in positions:
+                            price = float(pos.get("price") or 0.0)
+                            size = float(pos.get("netSize") or 0.0)
+                            pos["marketValue"] = round(price * size, 2)
+
+                    for pos in positions:
+                        net_val += float(pos.get("marketValue") or 0.0)
+                portfolio_data = {"netValue": round(net_val, 2), "positions": positions}
+
+            return timeline_events, portfolio_data
+        finally:
+            close_fn = getattr(api, "close", None)
+            if callable(close_fn):
+                res = close_fn()
+                if asyncio.iscoroutine(res):
+                    await res
 
     def fetch_timeline_and_portfolio(
         self,

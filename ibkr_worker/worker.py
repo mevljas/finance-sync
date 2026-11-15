@@ -34,6 +34,7 @@ class IBKRSyncSummary:
     cash_events_synced: int
     skipped_duplicates: int
     patched_initial_balance: float | None
+    deleted_existing_records: int = 0
     dry_run: bool = False
 
 
@@ -71,8 +72,17 @@ class IBKRWorker:
             return parse_flex_xml(load_mock_ibkr_xml())
         return self.flex_client.fetch_and_parse()
 
-    def sync_once(self) -> IBKRSyncSummary:
+    def sync_once(self, *, purge_existing_records: bool = False) -> IBKRSyncSummary:
         """Run a single sync cycle for IBKR trades, dividends, and portfolio value."""
+        deleted_existing = 0
+        if purge_existing_records:
+            existing_records = self.bb_client.get_records(self.settings.bb_ibkr_account_id)
+            existing_ids = [
+                str(rec["id"]) for rec in existing_records if rec.get("id") is not None
+            ]
+            if existing_ids:
+                deleted_existing = self.bb_client.delete_records(existing_ids)
+
         statement = self.fetch_statement_data()
         records_to_create: list[CreateRecordPayload] = []
         seen_entries_to_mark: list[SeenRecordEntry] = []
@@ -173,11 +183,12 @@ class IBKRWorker:
 
         logger.info(
             "IBKR sync complete (dry_run=%s): trades=%d, cash_events=%d, "
-            "duplicates=%d, patched_initial=%s",
+            "duplicates=%d, deleted_existing=%d, patched_initial=%s",
             is_dry_run,
             trades_synced,
             cash_events_synced,
             skipped_duplicates,
+            deleted_existing,
             patched_initial,
         )
         return IBKRSyncSummary(
@@ -185,6 +196,7 @@ class IBKRWorker:
             cash_events_synced=cash_events_synced,
             skipped_duplicates=skipped_duplicates,
             patched_initial_balance=patched_initial,
+            deleted_existing_records=deleted_existing,
             dry_run=is_dry_run,
         )
 
@@ -217,6 +229,11 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Write JSON dry-run preview report to file (implies --dry-run)",
     )
+    parser.add_argument(
+        "--purge-account-records",
+        action="store_true",
+        help="Delete existing records on BB_IBKR_ACCOUNT_ID before syncing",
+    )
     args = parser.parse_args(argv)
 
     settings = get_settings()
@@ -236,8 +253,8 @@ def main(argv: list[str] | None = None) -> int:
     ) as bb_client:
         worker = IBKRWorker(settings=settings, db=db, bb_client=bb_client)
         try:
-            if args.once or args.dry_run_output is not None:
-                summary = worker.sync_once()
+            if args.once or args.dry_run_output is not None or args.purge_account_records:
+                summary = worker.sync_once(purge_existing_records=args.purge_account_records)
                 if args.dry_run_output is not None:
                     report: dict[str, Any] = {
                         "broker": IBKRWorker.BROKER_NAME,
@@ -246,8 +263,10 @@ def main(argv: list[str] | None = None) -> int:
                             "trades_synced": summary.trades_synced,
                             "cash_events_synced": summary.cash_events_synced,
                             "skipped_duplicates": summary.skipped_duplicates,
+                            "deleted_existing_records": summary.deleted_existing_records,
                             "patched_initial_balance": summary.patched_initial_balance,
                         },
+                        "would_delete_record_ids": bb_client.dry_run_deleted_ids,
                         "would_create_records": bb_client.dry_run_created,
                         "would_patch_accounts": bb_client.dry_run_patched_accounts,
                     }

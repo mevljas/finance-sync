@@ -8,7 +8,7 @@ import time
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 import httpx
@@ -135,8 +135,11 @@ def parse_flex_xml(xml_bytes: bytes) -> IBKRStatementData:
         if not account_id:
             account_id = str(getattr(stmt, "accountId", "") or "")
 
-        # 1. Parse Trades
+        # 1. Parse Trades (skip internal CASH FX conversions and zero-cash entries)
         for trade in getattr(stmt, "Trades", ()):
+            asset_cat = _enum_name(getattr(trade, "assetCategory", "")).upper()
+            if asset_cat == "CASH":
+                continue
             symbol = str(getattr(trade, "symbol", "") or "").strip()
             isin = str(
                 getattr(trade, "isin", None) or getattr(trade, "securityID", None) or symbol
@@ -150,6 +153,8 @@ def parse_flex_xml(xml_bytes: bytes) -> IBKRStatementData:
                 proceeds = _to_decimal(getattr(trade, "proceeds", 0))
                 commission = _to_decimal(getattr(trade, "ibCommission", 0))
                 net_cash = proceeds + commission
+            if net_cash.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) == Decimal("0.00"):
+                continue
             if side == "BUY" and net_cash > Decimal("0"):
                 net_cash = -net_cash
             elif side == "SELL" and net_cash < Decimal("0"):
@@ -210,13 +215,20 @@ def parse_flex_xml(xml_bytes: bytes) -> IBKRStatementData:
                 )
             )
 
-        # 3. Parse OpenPositions market value
+        # 3. Parse OpenPositions market value (converted to base currency via fxRateToBase)
         for pos in getattr(stmt, "OpenPositions", ()):
+            pos_val_in_base = _to_decimal(getattr(pos, "positionValueInBase", None))
+            if pos_val_in_base != Decimal("0"):
+                open_positions_value += pos_val_in_base
+                continue
             pos_val = _to_decimal(getattr(pos, "positionValue", None))
             if pos_val == Decimal("0"):
                 qty = _to_decimal(getattr(pos, "position", 0))
                 mark = _to_decimal(getattr(pos, "markPrice", 0))
                 pos_val = qty * mark
+            fx_rate = _to_decimal(getattr(pos, "fxRateToBase", None), default="1")
+            if fx_rate > Decimal("0"):
+                pos_val *= fx_rate
             open_positions_value += pos_val
 
         # 4. Parse CashReport ending cash
@@ -234,8 +246,8 @@ def parse_flex_xml(xml_bytes: bytes) -> IBKRStatementData:
         account_id=account_id,
         trades=trades,
         cash_events=cash_events,
-        open_positions_value=open_positions_value,
-        ending_cash=ending_cash,
+        open_positions_value=open_positions_value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+        ending_cash=ending_cash.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
     )
 
 

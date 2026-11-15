@@ -152,3 +152,75 @@ def test_ibkr_worker_dry_run_never_mutates_sqlite_or_wallet(
         assert dedup_store.count() == 3
         assert post_records_route.call_count == 1
         assert patch_acc_route.call_count == 1
+
+
+@respx.mock
+def test_ibkr_worker_purge_existing_records_in_dry_run_and_live(
+    test_settings: Settings,
+    dedup_store: DeduplicationStore,
+) -> None:
+    """Verify --purge-account-records previews deletions in dry-run and deletes in live mode."""
+    acc_id = test_settings.bb_ibkr_account_id
+    respx.get("https://rest.budgetbakers.com/wallet/v1/api/records").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "records": [
+                    {"id": "00000000-0000-0000-0000-000000000011"},
+                    {"id": "00000000-0000-0000-0000-000000000012"},
+                ]
+            },
+        )
+    )
+    delete_route = respx.delete("https://rest.budgetbakers.com/wallet/v1/api/records").mock(
+        return_value=httpx.Response(200, json={"summary": {"succeeded": 2}})
+    )
+    respx.post("https://rest.budgetbakers.com/wallet/v1/api/records").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"id": "rec-1", "success": True},
+                    {"id": "rec-2", "success": True},
+                    {"id": "rec-3", "success": True},
+                ]
+            },
+        )
+    )
+    respx.get("https://rest.budgetbakers.com/wallet/v1/api/accounts").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "accounts": [
+                    {
+                        "id": acc_id,
+                        "recordStats": {"totalIncomes": 25.0, "totalExpenses": 1502.0},
+                    }
+                ]
+            },
+        )
+    )
+    respx.patch("https://rest.budgetbakers.com/wallet/v1/api/accounts").mock(
+        return_value=httpx.Response(
+            200,
+            json={"results": [{"id": acc_id, "success": True}]},
+        )
+    )
+
+    dry_settings = test_settings.model_copy(update={"use_mock_data": True, "dry_run": True})
+    with BudgetBakersClient(token="test-token", dry_run=True, use_mock_data=False) as dry_bb:
+        dry_worker = IBKRWorker(settings=dry_settings, db=dedup_store, bb_client=dry_bb)
+        dry_summary = dry_worker.sync_once(purge_existing_records=True)
+        assert dry_summary.deleted_existing_records == 2
+        assert dry_bb.dry_run_deleted_ids == [
+            "00000000-0000-0000-0000-000000000011",
+            "00000000-0000-0000-0000-000000000012",
+        ]
+        assert delete_route.call_count == 0
+
+    live_settings = test_settings.model_copy(update={"use_mock_data": True, "dry_run": False})
+    with BudgetBakersClient(token="test-token", dry_run=False) as live_bb:
+        live_worker = IBKRWorker(settings=live_settings, db=dedup_store, bb_client=live_bb)
+        live_summary = live_worker.sync_once(purge_existing_records=True)
+        assert live_summary.deleted_existing_records == 2
+        assert delete_route.call_count == 1

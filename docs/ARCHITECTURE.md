@@ -57,8 +57,8 @@ flowchart LR
 - Supports read-only **Dry-Run Mode** (`dry_run=True`): blocks all `POST`, `DELETE`, and `PATCH` mutations while recording preview payloads (`dry_run_created`, `dry_run_deleted_ids`, `dry_run_patched_accounts`) and performing read-only `GET` queries (with offline stub fallback when `use_mock_data=True`).
 
 ### `ibkr_worker/`
-- `flex_client.py`: Executes the two-step IBKR Flex Web Service protocol (`FlexClient`) and parses the resulting XML bytes via `ibflex2` (`parse_flex_xml`) into typed `IBKRStatementData`, `IBKRTradeEvent`, and `IBKRCashEvent` models.
-- `worker.py`: Orchestrates polling (`IBKRWorker`), per-batch SQLite deduplication (skipped in dry-run mode), record creation on `BB_IBKR_ACCOUNT_ID`, live portfolio balance patching, and CLI flags (`--once`, `--dry-run`, `--dry-run-output`).
+- `flex_client.py`: Executes the two-step IBKR Flex Web Service protocol (`FlexClient`) and parses the resulting XML bytes via `ibflex2` (`parse_flex_xml`) into typed `IBKRStatementData`, `IBKRTradeEvent`, and `IBKRCashEvent` models (converting `OpenPositions` to base currency via `fxRateToBase` and skipping internal `assetCategory="CASH"` FX conversion rows).
+- `worker.py`: Orchestrates polling (`IBKRWorker`), optional one-time account record purge (`--purge-account-records`), per-batch SQLite deduplication (skipped in dry-run mode), record creation on `BB_IBKR_ACCOUNT_ID`, live portfolio balance patching, and CLI flags (`--once`, `--dry-run`, `--dry-run-output`, `--purge-account-records`).
 
 ### `tr_worker/`
 - `session_manager.py`: Wraps `pytr` session persistence in `/app/data` (`TRSessionManager`) and implements `Discord2FAClient` using Discord REST API v10 to request and read a 4-digit 2FA verification PIN when the session expires.

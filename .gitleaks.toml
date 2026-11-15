@@ -8,6 +8,7 @@ description = "Synthetic unit/integration/e2e test fixtures and sanitized env te
 paths = [
     '''^\.env\.example$''',
     '''^tests/fixtures/.*''',
+    '''^input/.*''',
 ]
 
 [[allowlists]]

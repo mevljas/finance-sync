@@ -17,6 +17,7 @@ Before modifying code, consult these source-of-truth documents in `docs/`:
   - [`0003-discord-bot-2fa-renewal.md`](./docs/adr/0003-discord-bot-2fa-renewal.md)
   - [`0004-gitleaks-secret-scanning-and-test-fixtures.md`](./docs/adr/0004-gitleaks-secret-scanning-and-test-fixtures.md)
   - [`0005-read-only-dry-run-mode.md`](./docs/adr/0005-read-only-dry-run-mode.md)
+  - [`0006-ibkr-multi-currency-fx-filtering-and-purge.md`](./docs/adr/0006-ibkr-multi-currency-fx-filtering-and-purge.md)
 
 ---
 

@@ -5,9 +5,16 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from config.settings import Settings
+from config.settings import Settings, get_settings
 from pydantic import SecretStr
 from shared.database import DeduplicationStore
+
+
+@pytest.fixture(autouse=True)
+def isolate_env_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ensure tests never load a local live .env file from the repository root."""
+    monkeypatch.setitem(Settings.model_config, "env_file", None)
+    get_settings.cache_clear()
 
 
 @pytest.fixture

@@ -64,8 +64,9 @@ def _extract_trade_details(event: dict[str, Any]) -> tuple[str, str, Decimal, De
     shares = Decimal(str(details.get("shares") or event.get("shares") or "0"))
     price = Decimal(str(details.get("price") or event.get("price") or "0"))
 
-    # Also support pytr detail sections if present
-    for section in event.get("sections", []):
+    # Also support pytr detail sections if present (top-level or nested under details)
+    sections = event.get("sections") or details.get("sections") or []
+    for section in sections:
         if not isinstance(section, dict):
             continue
         for item in section.get("data", []):

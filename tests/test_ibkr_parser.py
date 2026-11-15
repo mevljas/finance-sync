@@ -87,6 +87,87 @@ def test_flex_client_two_step_polling_with_retry_on_1019() -> None:
     assert data.total_portfolio_value == Decimal("10100.00")
 
 
+def test_parse_flex_xml_converts_non_eur_open_positions_via_fx_rate_to_base() -> None:
+    """Verify OpenPositions multiplies foreign positionValue by fxRateToBase."""
+    xml_bytes = (
+        b'<FlexQueryResponse queryName="ActivityFlexQuery" type="AF">\n'
+        b'  <FlexStatements count="1">\n'
+        b'    <FlexStatement accountId="DU0000000" fromDate="2026-01-01"\n'
+        b'                   toDate="2026-11-15" period="Last365CalendarDays"\n'
+        b'                   whenGenerated="2026-11-15;12:00:00">\n'
+        b"      <CashReport>\n"
+        b'        <CashReportCurrency accountId="DU0000000" currency="BASE_SUMMARY"\n'
+        b'                            endingCash="150.00" endingSettledCash="150.00" />\n'
+        b"      </CashReport>\n"
+        b"      <OpenPositions>\n"
+        b'        <OpenPosition accountId="DU0000000" assetCategory="STK" symbol="FAKEEUR"\n'
+        b'                      isin="XF0000000001" currency="EUR" fxRateToBase="1"\n'
+        b'                      position="10" markPrice="100.00" positionValue="1000.00"\n'
+        b'                      side="Long" />\n'
+        b'        <OpenPosition accountId="DU0000000" assetCategory="STK" symbol="FAKEUSD"\n'
+        b'                      isin="US0000000001" currency="USD" fxRateToBase="0.92"\n'
+        b'                      position="10" markPrice="200.00" positionValue="2000.00"\n'
+        b'                      side="Long" />\n'
+        b'        <OpenPosition accountId="DU0000000" assetCategory="STK" symbol="FAKEGBP"\n'
+        b'                      isin="GB0000000001" currency="GBP" fxRateToBase="1.20"\n'
+        b'                      position="5" markPrice="100.00" side="Long" />\n'
+        b"      </OpenPositions>\n"
+        b"    </FlexStatement>\n"
+        b"  </FlexStatements>\n"
+        b"</FlexQueryResponse>"
+    )
+
+    stmt = parse_flex_xml(xml_bytes)
+
+    # 1000*1 + 2000*0.92 + (5*100)*1.20 = 1000.00 + 1840.00 + 600.00 = 3440.00
+    assert stmt.open_positions_value == Decimal("3440.00")
+    assert stmt.ending_cash == Decimal("150.00")
+    assert stmt.total_portfolio_value == Decimal("3590.00")
+
+
+def test_parse_flex_xml_skips_cash_fx_trades_and_quantizes_ending_cash() -> None:
+    """Verify parse_flex_xml skips assetCategory=CASH FX trades and rounds ending_cash."""
+    xml_bytes = (
+        b'<FlexQueryResponse queryName="ActivityFlexQuery" type="AF">\n'
+        b'  <FlexStatements count="1">\n'
+        b'    <FlexStatement accountId="DU0000000" fromDate="2026-01-01"\n'
+        b'                   toDate="2026-11-15" period="Last365CalendarDays"\n'
+        b'                   whenGenerated="2026-11-15;12:00:00">\n'
+        b"      <CashReport>\n"
+        b'        <CashReportCurrency accountId="DU0000000" currency="BASE_SUMMARY"\n'
+        b'                            endingCash="2586.721525031"\n'
+        b'                            endingSettledCash="2586.721525031" />\n'
+        b"      </CashReport>\n"
+        b"      <Trades>\n"
+        b'        <Trade accountId="DU0000000" assetCategory="STK" symbol="FAKE"\n'
+        b'               isin="XF0000000001" currency="USD" tradeID="TRD-0001"\n'
+        b'               dateTime="20261030;09:39:39" tradeDate="20261030"\n'
+        b'               buySell="BUY" quantity="4" tradePrice="280.22"\n'
+        b'               netCash="-1121.23106925" proceeds="-1120.88"\n'
+        b'               ibCommission="-0.35106925" />\n'
+        b'        <Trade accountId="DU0000000" assetCategory="CASH" symbol="EUR.USD"\n'
+        b'               isin="" securityID="" currency="USD" tradeID="TRD-0002"\n'
+        b'               dateTime="20261030;09:39:40" tradeDate="20261030"\n'
+        b'               buySell="SELL" quantity="-1004.51" tradePrice="1.11567"\n'
+        b'               netCash="0" proceeds="1120.7016717" ibCommission="0" />\n'
+        b'        <Trade accountId="DU0000000" assetCategory="CASH" symbol="EUR.USD"\n'
+        b'               isin="" securityID="" currency="USD" tradeID="TRD-0003"\n'
+        b'               dateTime="20261030;17:00:00" tradeDate="20261030"\n'
+        b'               buySell="BUY" quantity="0.00528912" tradePrice="1.11616961"\n'
+        b'               netCash="0" proceeds="-0.005903551" ibCommission="0" />\n'
+        b"      </Trades>\n"
+        b"    </FlexStatement>\n"
+        b"  </FlexStatements>\n"
+        b"</FlexQueryResponse>"
+    )
+
+    stmt = parse_flex_xml(xml_bytes)
+
+    assert len(stmt.trades) == 1
+    assert stmt.trades[0].symbol == "FAKE"
+    assert stmt.ending_cash == Decimal("2586.72")
+
+
 @respx.mock
 def test_flex_client_raises_on_error_status() -> None:
     """Verify FlexWebServiceError is raised when SendRequest fails."""

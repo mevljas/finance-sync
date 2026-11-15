@@ -9,6 +9,7 @@
 
 # Local Runtime Data & SQLite
 data/
+input/
 *.db
 *.db-shm
 *.db-wal
