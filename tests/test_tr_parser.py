@@ -173,3 +173,167 @@ def test_discord_2fa_timeout_raises_session_error() -> None:
     with pytest.raises(TRSessionError, match="Timed out"):
         discord_client.prompt_and_wait_for_pin()
     discord_client.close()
+
+
+def test_parse_tr_timeline_detail_v2_nested_sections_and_saveback(
+    test_settings: Settings,
+) -> None:
+    """Verify timelineDetailV2 nested sections, icon ISIN, and localized decimals."""
+    events: list[dict[str, Any]] = [
+        {
+            "id": "tr-v2-sparplan-1",
+            "timestamp": "2026-10-16T13:52:16.663Z",
+            "eventType": "SAVINGS_PLAN_EXECUTED",
+            "title": "S&P 500 Information Tech USD (Acc)",
+            "subtitle": "Savings plan executed",
+            "icon": "logos/XF0000000001/v2",
+            "status": "EXECUTED",
+            "amount": {"value": -50.00, "currency": "EUR"},
+            "details": {
+                "sections": [
+                    {
+                        "title": "Übersicht",
+                        "data": [
+                            {
+                                "title": "Transaktion",
+                                "detail": {
+                                    "action": {
+                                        "payload": {
+                                            "sections": [
+                                                {
+                                                    "type": "table",
+                                                    "data": [
+                                                        {
+                                                            "title": "Aktien",
+                                                            "detail": {"text": "1,0870"},
+                                                        },
+                                                        {
+                                                            "title": "Quotation",
+                                                            "detail": {"text": "46,00 €"},
+                                                        },
+                                                    ],
+                                                }
+                                            ]
+                                        }
+                                    }
+                                },
+                            }
+                        ],
+                    }
+                ]
+            },
+        },
+        {
+            "id": "tr-v2-saveback-1",
+            "timestamp": "2026-11-02T14:56:53.151Z",
+            "eventType": "BENEFITS_SAVEBACK_EXECUTION",
+            "title": "S&P 500 Information Tech USD (Acc)",
+            "subtitle": "Saveback",
+            "status": "EXECUTED",
+            "amount": {"value": 8.71, "currency": "EUR"},
+            "details": {
+                "sections": [
+                    {
+                        "type": "header",
+                        "data": {"icon": {"asset": "logos/XF0000000001/v2"}},
+                    },
+                    {
+                        "title": "Overview",
+                        "data": [
+                            {
+                                "title": "Transaction",
+                                "detail": {
+                                    "displayValue": {"prefix": "0.1956 x "},
+                                },
+                            }
+                        ],
+                    },
+                ]
+            },
+        },
+    ]
+
+    parsed = parse_tr_timeline_events(events, test_settings)
+    assert len(parsed) == 3
+    by_id = {item.external_id: item for item in parsed}
+
+    buy_rec = by_id["tr-v2-sparplan-1:wealth"]
+    assert (
+        buy_rec.payload.note
+        == "BUY 1.0870 sh XF0000000001 (S&P 500 Information Tech USD (Acc)) @ 46.00 EUR"
+    )
+
+    saveback_rec = by_id["tr-v2-saveback-1:saveback"]
+    assert (
+        saveback_rec.payload.note
+        == "SAVEBACK 0.1956 sh XF0000000001 (S&P 500 Information Tech USD (Acc)) @ 44.53 EUR"
+    )
+
+
+@respx.mock
+def test_discord_2fa_6_digit_authenticator_and_mobile_confirm(tmp_path: Path) -> None:
+    """Verify 6-digit Authenticator code followed by mobile app confirmation."""
+    channel_id = "000000000000000001"
+    respx.post(f"https://discord.com/api/v10/channels/{channel_id}/messages").mock(
+        side_effect=[
+            httpx.Response(200, json={"id": "msg-prompt-1"}),
+            httpx.Response(200, json={"id": "msg-confirm-2"}),
+            httpx.Response(200, json={"id": "msg-step2-3"}),
+            httpx.Response(200, json={"id": "msg-done-4"}),
+        ]
+    )
+    respx.get(f"https://discord.com/api/v10/channels/{channel_id}/messages").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {"id": "msg-user", "content": "000000", "author": {"bot": False}},
+            ],
+        )
+    )
+
+    events_called: list[str] = []
+
+    class FakeV2TRApi:
+        weblogin_needs_authenticator = True
+        _required_action = "AUTHENTICATOR_VERIFICATION"
+
+        def __init__(self, **_: Any) -> None:
+            pass
+
+        def resume_websession(self) -> bool:
+            return False
+
+        def initiate_weblogin(self) -> None:
+            events_called.append("initiate")
+
+        def complete_weblogin(self, code: str) -> None:
+            events_called.append(f"complete:{code}")
+
+        def _get_weblogin_process(self, quiet: bool = False) -> dict[str, Any]:
+            assert quiet is True
+            return {"status": "PENDING", "requiredAction": "CONFIRMATION"}
+
+        def _await_weblogin_confirmation(self) -> None:
+            events_called.append("await_confirm")
+
+        def save_websession(self) -> None:
+            events_called.append("save")
+
+    discord_client = Discord2FAClient(
+        bot_token="bot-token",
+        channel_id=channel_id,
+        timeout_seconds=5.0,
+        poll_interval_seconds=0.0,
+        sleep_fn=lambda _: None,
+    )
+    manager = TRSessionManager(
+        phone_no="+49000000000",
+        pin="0000",
+        session_dir=tmp_path / "session",
+        discord_client=discord_client,
+        tr_api_factory=lambda **kw: FakeV2TRApi(**kw),
+    )
+
+    manager.ensure_authenticated()
+    assert events_called == ["initiate", "complete:000000", "await_confirm", "save"]
+    discord_client.close()

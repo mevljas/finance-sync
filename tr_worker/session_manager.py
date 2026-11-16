@@ -313,6 +313,14 @@ class TRSessionManager:
                             price = float(pos.get("price") or 0.0)
                             size = float(pos.get("netSize") or 0.0)
                             pos["marketValue"] = round(price * size, 2)
+                            logger.info(
+                                "TR position %s (%s): netSize=%s price=%s marketValue=%.2f",
+                                pos.get("instrumentId"),
+                                pos.get("name"),
+                                pos.get("netSize"),
+                                pos.get("price"),
+                                pos["marketValue"],
+                            )
 
                     for pos in positions:
                         net_val += float(pos.get("marketValue") or 0.0)

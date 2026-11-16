@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from enum import StrEnum
 from typing import Any
 
@@ -55,6 +57,28 @@ def _format_iso_utc(dt: datetime) -> str:
     return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
+_ISIN_RE = re.compile(r"\b([A-Z]{2}[A-Z0-9]{10})\b")
+
+
+def _parse_localized_decimal(text: str) -> Decimal | None:
+    """Extract a positive Decimal from a localized string like '0,1524' or '328,10 €'."""
+    cleaned = re.sub(r"[^\d,.-]", "", text).strip()
+    if not cleaned:
+        return None
+    if "," in cleaned and "." in cleaned:
+        if cleaned.rfind(",") > cleaned.rfind("."):
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        else:
+            cleaned = cleaned.replace(",", "")
+    elif "," in cleaned:
+        cleaned = cleaned.replace(",", ".")
+    try:
+        val = Decimal(cleaned)
+        return abs(val) if val != Decimal("0") else None
+    except Exception:
+        return None
+
+
 def _extract_trade_details(event: dict[str, Any]) -> tuple[str, str, Decimal, Decimal]:
     """Extract (symbol, isin, shares, price) from a Trade Republic event object."""
     details: dict[str, Any] = event.get("details") or {}
@@ -64,31 +88,93 @@ def _extract_trade_details(event: dict[str, Any]) -> tuple[str, str, Decimal, De
     shares = Decimal(str(details.get("shares") or event.get("shares") or "0"))
     price = Decimal(str(details.get("price") or event.get("price") or "0"))
 
-    # Also support pytr detail sections if present (top-level or nested under details)
-    sections = event.get("sections") or details.get("sections") or []
-    for section in sections:
-        if not isinstance(section, dict):
+    # 1. Extract ISIN from icon path (e.g. "logos/IE00B3WJKG14/v2") if not yet set
+    if isin == "UNKNOWN":
+        icon_str = str(event.get("icon") or "")
+        m = _ISIN_RE.search(icon_str.replace("/", " "))
+        if m:
+            isin = m.group(1)
+
+    # 2. Walk top-level and nested timelineDetailV2 sections
+    sections = list(event.get("sections") or details.get("sections") or [])
+    all_sections: list[dict[str, Any]] = []
+    for sec in sections:
+        if isinstance(sec, dict):
+            all_sections.append(sec)
+            for item in sec.get("data", []):
+                if isinstance(item, dict):
+                    nested = (
+                        (item.get("detail") or {})
+                        .get("action", {})
+                        .get("payload", {})
+                        .get("sections", [])
+                    )
+                    for nsec in nested:
+                        if isinstance(nsec, dict):
+                            all_sections.append(nsec)
+
+    for section in all_sections:
+        action = section.get("action")
+        if isinstance(action, dict) and action.get("type") == "instrumentDetail":
+            payload_isin = str(action.get("payload") or "").strip()
+            if _ISIN_RE.fullmatch(payload_isin):
+                isin = payload_isin
+        if section.get("type") == "header" and isin == "UNKNOWN":
+            data_obj = section.get("data")
+            if isinstance(data_obj, dict):
+                icon_val = data_obj.get("icon")
+                icon_s = (
+                    str(icon_val.get("asset") or "")
+                    if isinstance(icon_val, dict)
+                    else str(icon_val or "")
+                )
+                m = _ISIN_RE.search(icon_s.replace("/", " "))
+                if m:
+                    isin = m.group(1)
+
+        data_list = section.get("data")
+        if not isinstance(data_list, list):
             continue
-        for item in section.get("data", []):
+        for item in data_list:
             if not isinstance(item, dict):
                 continue
             label = str(item.get("title") or "").lower()
-            detail_text = str((item.get("detail") or {}).get("text") or "").strip()
+            detail_obj: dict[str, Any] = item.get("detail") or {}
+            detail_text = str(detail_obj.get("text") or "").strip()
+            prefix_text = str((detail_obj.get("displayValue") or {}).get("prefix") or "").strip()
+
             if "isin" in label and detail_text:
                 isin = detail_text
-            elif "shares" in label and detail_text:
-                num = detail_text.split()[0].replace(",", ".")
-                shares = Decimal(num)
-            elif "share price" in label and detail_text:
-                num = detail_text.split()[0].replace(",", ".")
-                price = Decimal(num)
+            elif any(k in label for k in ("shares", "aktien", "anteile")) and detail_text:
+                parsed_sh = _parse_localized_decimal(detail_text)
+                if parsed_sh is not None and shares == Decimal("0"):
+                    shares = parsed_sh
+            elif any(k in label for k in ("share price", "quotation", "kurs")) and detail_text:
+                parsed_pr = _parse_localized_decimal(detail_text)
+                if parsed_pr is not None and price == Decimal("0"):
+                    price = parsed_pr
+            elif any(k in label for k in ("transaktion", "transaction")) and prefix_text:
+                parsed_sh = _parse_localized_decimal(prefix_text)
+                if parsed_sh is not None and shares == Decimal("0"):
+                    shares = parsed_sh
+
+    # 3. Also consult pytr.event.Event.from_dict if shares or isin are still missing
+    if (isin == "UNKNOWN" or shares == Decimal("0")) and details.get("sections"):
+        with contextlib.suppress(Exception):
+            from pytr.event import Event
+
+            ev = Event.from_dict(event)
+            if ev.isin and isin == "UNKNOWN":
+                isin = str(ev.isin)
+            if ev.shares and shares == Decimal("0"):
+                shares = Decimal(str(ev.shares))
 
     amount_obj: dict[str, Any] = event.get("amount") or {}
     raw_amount = abs(Decimal(str(amount_obj.get("value") or "0")))
     if shares > Decimal("0") and price == Decimal("0") and raw_amount > Decimal("0"):
-        price = (raw_amount / shares).quantize(Decimal("0.01"))
+        price = (raw_amount / shares).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     elif price > Decimal("0") and shares == Decimal("0") and raw_amount > Decimal("0"):
-        shares = (raw_amount / price).quantize(Decimal("0.0001"))
+        shares = (raw_amount / price).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
 
     return symbol, isin, shares, price
 

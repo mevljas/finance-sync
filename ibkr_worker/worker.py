@@ -77,9 +77,7 @@ class IBKRWorker:
         deleted_existing = 0
         if purge_existing_records:
             existing_records = self.bb_client.get_records(self.settings.bb_ibkr_account_id)
-            existing_ids = [
-                str(rec["id"]) for rec in existing_records if rec.get("id") is not None
-            ]
+            existing_ids = [str(rec["id"]) for rec in existing_records if rec.get("id") is not None]
             if existing_ids:
                 deleted_existing = self.bb_client.delete_records(existing_ids)
 
