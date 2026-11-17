@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import httpx
 import respx
@@ -16,50 +17,33 @@ from tr_worker.worker import TRWorker
 def test_tr_worker_backfill_reconciliation_and_sync(
     test_settings: Settings,
     dedup_store: DeduplicationStore,
+    tmp_path: Path,
 ) -> None:
-    """Verify TRWorker deletes legacy -50 EUR savings plans, seeds manual interest, and syncs."""
+    """Verify TRWorker deletes IDs from delete_file, seeds manual interest, and syncs."""
     settings = test_settings.model_copy(update={"use_mock_data": True})
     cash_acc = settings.bb_tr_cash_account_id
     wealth_acc = settings.bb_tr_wealth_account_id
 
-    # Mock GET /records for backfill:
-    # 1st call: existing Fin. investments on TR cash -> returns 2 legacy -50 EUR records
-    # 2nd call: existing Interest, dividends on TR cash -> returns 2026-11-01 100.00 EUR Interest
+    delete_file = tmp_path / "delete_ids.json"
+    delete_file.write_text(
+        json.dumps({"record_ids": ["legacy-sav-1", "legacy-sav-2"]}),
+        encoding="utf-8",
+    )
+
     respx.get("https://rest.budgetbakers.com/wallet/v1/api/records").mock(
-        side_effect=[
-            httpx.Response(
-                200,
-                json={
-                    "records": [
-                        {
-                            "id": "legacy-sav-1",
-                            "note": "Savings plan",
-                            "amount": {"value": -50.0, "currencyCode": "EUR"},
-                            "recordDate": "2026-10-16T10:00:00.000Z",
-                        },
-                        {
-                            "id": "legacy-sav-2",
-                            "note": None,
-                            "amount": {"value": -50.0, "currencyCode": "EUR"},
-                            "recordDate": "2026-09-16T10:00:00.000Z",
-                        },
-                    ]
-                },
-            ),
-            httpx.Response(
-                200,
-                json={
-                    "records": [
-                        {
-                            "id": "existing-int-nov",
-                            "note": "Interest",
-                            "amount": {"value": 100.00, "currencyCode": "EUR"},
-                            "recordDate": "2026-11-01T08:00:00.000Z",
-                        }
-                    ]
-                },
-            ),
-        ]
+        return_value=httpx.Response(
+            200,
+            json={
+                "records": [
+                    {
+                        "id": "existing-int-nov",
+                        "note": "Interest",
+                        "amount": {"value": 100.00, "currencyCode": "EUR"},
+                        "recordDate": "2026-11-01T08:00:00.000Z",
+                    }
+                ]
+            },
+        )
     )
 
     delete_route = respx.delete("https://rest.budgetbakers.com/wallet/v1/api/records").mock(
@@ -97,12 +81,7 @@ def test_tr_worker_backfill_reconciliation_and_sync(
     with BudgetBakersClient(token="test-token") as bb_client:
         worker = TRWorker(settings=settings, db=dedup_store, bb_client=bb_client)
 
-        # First sync:
-        # - Deletes 2 legacy -50 EUR savings plan placeholders
-        # - Seeds 1 existing manual interest record (100.00 EUR on 2026-11-01)
-        # - Creates 8 new records (9 parsed minus 1 seeded interest)
-        # - Patches wealth account initialBalance = 1000.00 - 25.00 + 50.00 = 1025.00
-        summary1 = worker.sync_once()
+        summary1 = worker.sync_once(delete_file=delete_file)
         assert summary1.deleted_legacy_savings == 2
         assert summary1.records_created == 8
         assert summary1.skipped_duplicates == 1
@@ -130,66 +109,32 @@ def test_tr_worker_backfill_reconciliation_and_sync(
 def test_tr_worker_dry_run_previews_backfill_without_mutating_sqlite(
     test_settings: Settings,
     dedup_store: DeduplicationStore,
+    tmp_path: Path,
 ) -> None:
     """Verify TRWorker in dry_run mode previews backfill and creations without mutating SQLite."""
     dry_settings = test_settings.model_copy(update={"use_mock_data": True, "dry_run": True})
     wealth_acc = dry_settings.bb_tr_wealth_account_id
 
+    delete_file = tmp_path / "delete_ids.json"
+    delete_file.write_text(
+        json.dumps({"record_ids": ["legacy-sav-1"]}),
+        encoding="utf-8",
+    )
+
     respx.get("https://rest.budgetbakers.com/wallet/v1/api/records").mock(
-        side_effect=[
-            httpx.Response(
-                200,
-                json={
-                    "records": [
-                        {
-                            "id": "legacy-sav-1",
-                            "note": "Savings plan",
-                            "amount": {"value": -50.0, "currencyCode": "EUR"},
-                            "recordDate": "2026-10-16T10:00:00.000Z",
-                        }
-                    ]
-                },
-            ),
-            httpx.Response(
-                200,
-                json={
-                    "records": [
-                        {
-                            "id": "existing-int-nov",
-                            "note": "Interest",
-                            "amount": {"value": 100.00, "currencyCode": "EUR"},
-                            "recordDate": "2026-11-01T08:00:00.000Z",
-                        }
-                    ]
-                },
-            ),
-            httpx.Response(
-                200,
-                json={
-                    "records": [
-                        {
-                            "id": "legacy-sav-1",
-                            "note": "Savings plan",
-                            "amount": {"value": -50.0, "currencyCode": "EUR"},
-                            "recordDate": "2026-10-16T10:00:00.000Z",
-                        }
-                    ]
-                },
-            ),
-            httpx.Response(
-                200,
-                json={
-                    "records": [
-                        {
-                            "id": "existing-int-nov",
-                            "note": "Interest",
-                            "amount": {"value": 100.00, "currencyCode": "EUR"},
-                            "recordDate": "2026-11-01T08:00:00.000Z",
-                        }
-                    ]
-                },
-            ),
-        ]
+        return_value=httpx.Response(
+            200,
+            json={
+                "records": [
+                    {
+                        "id": "existing-int-nov",
+                        "note": "Interest",
+                        "amount": {"value": 100.00, "currencyCode": "EUR"},
+                        "recordDate": "2026-11-01T08:00:00.000Z",
+                    }
+                ]
+            },
+        )
     )
     delete_route = respx.delete("https://rest.budgetbakers.com/wallet/v1/api/records").mock(
         return_value=httpx.Response(200, json={"summary": {"succeeded": 1}})
@@ -225,7 +170,7 @@ def test_tr_worker_dry_run_previews_backfill_without_mutating_sqlite(
 
     with BudgetBakersClient(token="test-token", dry_run=True, use_mock_data=False) as dry_bb:
         dry_worker = TRWorker(settings=dry_settings, db=dedup_store, bb_client=dry_bb)
-        dry_summary = dry_worker.sync_once()
+        dry_summary = dry_worker.sync_once(delete_file=delete_file)
 
         assert dry_summary.dry_run is True
         assert dry_summary.deleted_legacy_savings == 1
@@ -246,7 +191,7 @@ def test_tr_worker_dry_run_previews_backfill_without_mutating_sqlite(
     live_settings = test_settings.model_copy(update={"use_mock_data": True, "dry_run": False})
     with BudgetBakersClient(token="test-token", dry_run=False) as live_bb:
         live_worker = TRWorker(settings=live_settings, db=dedup_store, bb_client=live_bb)
-        live_summary = live_worker.sync_once()
+        live_summary = live_worker.sync_once(delete_file=delete_file)
         assert live_summary.dry_run is False
         assert live_summary.deleted_legacy_savings == 1
         assert live_summary.records_created == 8

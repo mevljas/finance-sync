@@ -292,3 +292,18 @@ def test_budgetbakers_dry_run_and_error_handling() -> None:
     ):
         client.get_account("acc-1")
     assert exc_info.value.status_code == 401
+
+
+@respx.mock
+def test_budgetbakers_get_records_follows_next_offset_pagination() -> None:
+    """Verify get_records follows nextOffset across multiple pages."""
+    route = respx.get("https://rest.budgetbakers.com/wallet/v1/api/records").mock(
+        side_effect=[
+            httpx.Response(200, json={"records": [{"id": "rec-1"}], "nextOffset": 1}),
+            httpx.Response(200, json={"records": [{"id": "rec-2"}], "nextOffset": None}),
+        ]
+    )
+    with BudgetBakersClient(token="test-token") as client:
+        records = client.get_records("acc-1", limit=1)
+    assert [r["id"] for r in records] == ["rec-1", "rec-2"]
+    assert route.call_count == 2

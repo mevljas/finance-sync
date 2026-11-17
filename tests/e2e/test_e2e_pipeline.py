@@ -262,8 +262,26 @@ def test_e2e_cli_dry_run_flags_and_json_report_export(
         side_effect=wallet.handle_delete_records
     )
 
+    delete_file = tmp_path / "tr_delete.json"
+    delete_file.write_text(
+        json.dumps({"record_ids": ["manual-sav-1"]}),
+        encoding="utf-8",
+    )
+
     assert ibkr_main(["--once", "--dry-run", "--dry-run-output", str(ibkr_report_file)]) == 0
-    assert tr_main(["--once", "--dry-run", "--dry-run-output", str(tr_report_file)]) == 0
+    assert (
+        tr_main(
+            [
+                "--once",
+                "--dry-run",
+                "--delete-file",
+                str(delete_file),
+                "--dry-run-output",
+                str(tr_report_file),
+            ]
+        )
+        == 0
+    )
 
     assert ibkr_report_file.exists()
     assert tr_report_file.exists()

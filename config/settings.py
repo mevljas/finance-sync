@@ -129,6 +129,25 @@ class Settings(BaseSettings):
         alias="BB_TR_WEALTH_ACCOUNT_ID",
     )
 
+    # BudgetBakers CouchDB (Native Stock Holdings Sync)
+    bb_couchdb_url: str = Field(
+        default="https://couch-prod-eu-2.budgetbakers.com",
+        alias="BB_COUCHDB_URL",
+    )
+    bb_couchdb_user: str = Field(
+        default="",
+        alias="BB_COUCHDB_USER",
+    )
+    bb_couchdb_password: SecretStr = Field(
+        default=SecretStr(""),
+        alias="BB_COUCHDB_PASSWORD",
+    )
+
+    @property
+    def has_couchdb(self) -> bool:
+        """Return True when CouchDB stock holdings sync credentials are configured."""
+        return bool(self.bb_couchdb_user.strip() and self.bb_couchdb_password.get_secret_value())
+
     # BudgetBakers Category UUIDs
     bb_category_investments: str = Field(
         default=CATEGORY_INVESTMENTS,

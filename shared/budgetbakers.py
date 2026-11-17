@@ -35,6 +35,15 @@ class AmountPayload(BaseModel):
     currency_code: str = Field(default="EUR", serialization_alias="currencyCode")
 
 
+class TransferPayload(BaseModel):
+    """Paired or unpaired transfer settings for POST /v1/api/records."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    pairing_mode: str = Field(default="new", serialization_alias="pairingMode")
+    account_id: str | None = Field(default=None, serialization_alias="accountId")
+
+
 class CreateRecordPayload(BaseModel):
     """Single transaction record payload for POST /v1/api/records."""
 
@@ -42,15 +51,19 @@ class CreateRecordPayload(BaseModel):
 
     account_id: str = Field(serialization_alias="accountId")
     amount: AmountPayload
-    category_id: str = Field(serialization_alias="categoryId")
+    category_id: str | None = Field(default=None, serialization_alias="categoryId")
     record_date: str = Field(serialization_alias="recordDate")
     counter_party: str | None = Field(default=None, serialization_alias="counterParty")
     note: str | None = Field(default=None)
     record_state: str = Field(default="cleared", serialization_alias="recordState")
+    transfer: TransferPayload | None = Field(default=None)
 
     def to_api_dict(self) -> dict[str, Any]:
         """Serialize to exact BudgetBakers OpenAPI dictionary format."""
-        return self.model_dump(by_alias=True, exclude_none=True)
+        data = self.model_dump(by_alias=True, exclude_none=True)
+        if self.transfer is not None:
+            data.pop("categoryId", None)
+        return data
 
 
 def format_stock_buy_note(
@@ -250,27 +263,46 @@ class BudgetBakersClient:
         record_date_gte: str | None = None,
         limit: int = 200,
     ) -> list[dict[str, Any]]:
-        """Query existing records via GET /v1/api/records."""
-        params: dict[str, Any] = {
+        """Query existing records via GET /v1/api/records, following nextOffset pagination."""
+        page_limit = min(max(limit, 1), 200)
+        base_params: dict[str, Any] = {
             "accountId": account_id,
-            "limit": min(max(limit, 1), 200),
+            "limit": page_limit,
         }
         if category_id:
-            params["categoryId"] = category_id
+            base_params["categoryId"] = category_id
         if record_date_gte:
-            params["recordDate"] = f"gte.{record_date_gte}"
+            base_params["recordDate"] = f"gte.{record_date_gte}"
 
-        if self.dry_run and self.use_mock_data:
-            try:
-                data_try: dict[str, Any] = self._request("GET", "/records", params=params)
-                recs_try: list[dict[str, Any]] = data_try.get("records", [])
-                return recs_try
-            except (httpx.HTTPError, BudgetBakersAPIError):
-                return []
+        all_records: list[dict[str, Any]] = []
+        offset = 0
+        while True:
+            params = dict(base_params)
+            if offset > 0:
+                params["offset"] = offset
 
-        data: dict[str, Any] = self._request("GET", "/records", params=params)
-        records: list[dict[str, Any]] = data.get("records", [])
-        return records
+            if self.dry_run and self.use_mock_data:
+                try:
+                    data_try: dict[str, Any] = self._request("GET", "/records", params=params)
+                except (httpx.HTTPError, BudgetBakersAPIError):
+                    return all_records
+                page_try: list[dict[str, Any]] = data_try.get("records", [])
+                all_records.extend(page_try)
+                next_off = data_try.get("nextOffset")
+                if next_off is None or int(next_off) <= offset:
+                    return all_records
+                offset = int(next_off)
+                continue
+
+            data: dict[str, Any] = self._request("GET", "/records", params=params)
+            page: list[dict[str, Any]] = data.get("records", [])
+            all_records.extend(page)
+            next_offset = data.get("nextOffset")
+            if next_offset is None or int(next_offset) <= offset or not page:
+                break
+            offset = int(next_offset)
+
+        return all_records
 
     def delete_records(self, record_ids: Sequence[str]) -> int:
         """Delete records via DELETE /v1/api/records in chunks of at most 10 IDs."""

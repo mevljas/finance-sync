@@ -15,8 +15,10 @@ from config.settings import Settings
 from shared.budgetbakers import (
     AmountPayload,
     CreateRecordPayload,
+    TransferPayload,
     format_stock_buy_note,
 )
+from shared.couchdb import LivePositionInput, StockTradeInput
 
 
 class TRRecordKind(StrEnum):
@@ -215,6 +217,9 @@ def parse_tr_timeline_events(
 
         # 1. 1% Saveback bonus income -> Trade republic wealth
         if "saveback" in event_type or "saveback" in title_lower or "saveback" in subtitle_lower:
+            if settings.has_couchdb:
+                # Synced as a native -AssetTransaction stock purchase in CouchDB
+                continue
             symbol, isin, shares, price = _extract_trade_details(event)
             positive_amount = round(abs(raw_amount), 2)
             if shares > 0 and isin != "UNKNOWN":
@@ -285,6 +290,33 @@ def parse_tr_timeline_events(
                 currency=currency,
                 side="BUY",
             )
+            if settings.has_couchdb:
+                # 3a. Create paired Transfer TR Cash -> TR Wealth (stock buy synced via CouchDB)
+                transfer_note = f"Savings plan: {title}"[:255] if title else buy_note
+                parsed.append(
+                    ParsedTRRecord(
+                        external_id=f"{event_id}:cash",
+                        kind=TRRecordKind.SAVINGS_PLAN_CASH,
+                        timestamp=iso_ts,
+                        amount=expense_amount,
+                        currency=currency,
+                        payload=CreateRecordPayload(
+                            account_id=settings.bb_tr_cash_account_id,
+                            amount=AmountPayload(value=expense_amount, currency_code=currency),
+                            category_id=None,
+                            record_date=iso_ts,
+                            counter_party="Trade Republic",
+                            note=transfer_note,
+                            transfer=TransferPayload(
+                                pairing_mode="new",
+                                account_id=settings.bb_tr_wealth_account_id,
+                            ),
+                        ),
+                    )
+                )
+                continue
+
+            # Legacy/REST-only mode:
             # 3a. Deduct cash from Trade Republic cash account
             parsed.append(
                 ParsedTRRecord(
@@ -415,3 +447,80 @@ def parse_tr_portfolio_value(portfolio_payload: dict[str, Any]) -> Decimal:
             price = Decimal(str(pos.get("currentPrice") or "0"))
             total += size * price
     return total.quantize(Decimal("0.01"))
+
+
+def parse_tr_stock_trades(events: Sequence[dict[str, Any]]) -> list[StockTradeInput]:
+    """Extract stock buy and 1% Saveback transactions from Trade Republic timeline events."""
+    trades: list[StockTradeInput] = []
+    for event in events:
+        status = str(event.get("status") or "EXECUTED").upper()
+        if status in ("CANCELED", "CANCELLED", "FAILED", "REJECTED", "PENDING"):
+            continue
+        event_id = str(event.get("id") or "").strip()
+        raw_ts = str(event.get("timestamp") or "").strip()
+        if not event_id or not raw_ts:
+            continue
+        amount_dict: dict[str, Any] = event.get("amount") or {}
+        if "value" not in amount_dict or amount_dict["value"] is None:
+            continue
+        raw_amount = Decimal(str(amount_dict["value"]))
+        if raw_amount == Decimal("0"):
+            continue
+        currency = str(amount_dict.get("currency") or "EUR")
+        iso_ts = _format_iso_utc(_parse_iso_datetime(raw_ts))
+
+        event_type = str(event.get("eventType") or "").lower()
+        title = str(event.get("title") or "").strip().lower()
+        subtitle = str(event.get("subtitle") or "").strip().lower()
+
+        is_saveback = "saveback" in event_type or "saveback" in title or "saveback" in subtitle
+        is_savings_or_buy = any(
+            kw in event_type or kw in subtitle
+            for kw in ("savings_plan", "savings plan", "sparplan", "order_executed", "buy order")
+        )
+        if not (is_saveback or is_savings_or_buy):
+            continue
+
+        symbol, isin, shares, price = _extract_trade_details(event)
+        if shares <= Decimal("0") or isin == "UNKNOWN":
+            continue
+
+        ext_id = f"{event_id}:saveback" if is_saveback else event_id
+        trades.append(
+            StockTradeInput(
+                external_id=ext_id,
+                timestamp=iso_ts,
+                symbol=symbol,
+                isin=isin,
+                quantity=shares,
+                price=price,
+                price_currency=currency,
+                cash_amount_eur=abs(raw_amount),
+                side="BUY",
+            )
+        )
+    return trades
+
+
+def parse_tr_live_positions(portfolio_payload: dict[str, Any]) -> list[LivePositionInput]:
+    """Extract live positions from Trade Republic portfolio payload for CouchDB reconciliation."""
+    positions: list[LivePositionInput] = []
+    for pos in portfolio_payload.get("positions", []):
+        if not isinstance(pos, dict):
+            continue
+        isin = str(pos.get("instrumentId") or pos.get("isin") or "").strip()
+        symbol = str(pos.get("name") or pos.get("symbol") or isin).strip()
+        qty = Decimal(str(pos.get("netSize") or "0"))
+        price = Decimal(str(pos.get("currentPrice") or pos.get("averageBuyIn") or "0"))
+        if isin and qty > Decimal("0"):
+            positions.append(
+                LivePositionInput(
+                    symbol=symbol,
+                    isin=isin,
+                    quantity=qty,
+                    unit_price=price,
+                    unit_price_currency="EUR",
+                    unit_price_eur=price,
+                )
+            )
+    return positions

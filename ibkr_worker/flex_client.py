@@ -6,7 +6,7 @@ import datetime as dt
 import logging
 import time
 import xml.etree.ElementTree as ET
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
@@ -41,6 +41,19 @@ class IBKRTradeEvent:
     net_cash: Decimal
     currency: str
     timestamp: str
+    fx_rate_to_base: Decimal = Decimal("1")
+
+
+@dataclass(frozen=True, slots=True)
+class IBKROpenPosition:
+    """Normalized live open position parsed from IBKR Flex XML."""
+
+    symbol: str
+    isin: str
+    currency: str
+    quantity: Decimal
+    mark_price: Decimal
+    fx_rate_to_base: Decimal = Decimal("1")
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +68,7 @@ class IBKRCashEvent:
     currency: str
     description: str
     timestamp: str
+    fx_rate_to_base: Decimal = Decimal("1")
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +80,8 @@ class IBKRStatementData:
     cash_events: list[IBKRCashEvent] = field(default_factory=list)
     open_positions_value: Decimal = Decimal("0.00")
     ending_cash: Decimal = Decimal("0.00")
+    open_positions: list[IBKROpenPosition] = field(default_factory=list)
+    to_date: str = ""
 
     @property
     def total_portfolio_value(self) -> Decimal:
@@ -126,19 +142,33 @@ def parse_flex_xml(xml_bytes: bytes) -> IBKRStatementData:
         raise FlexWebServiceError("No FlexStatements found in IBKR XML response")
 
     account_id = ""
+    to_date = ""
     trades: list[IBKRTradeEvent] = []
     cash_events: list[IBKRCashEvent] = []
+    open_positions: list[IBKROpenPosition] = []
     open_positions_value = Decimal("0.00")
     ending_cash = Decimal("0.00")
 
     for stmt in statements:
         if not account_id:
             account_id = str(getattr(stmt, "accountId", "") or "")
+        stmt_to_date = _format_iso_timestamp(getattr(stmt, "toDate", None))
+        if stmt_to_date and stmt_to_date != "1970-01-01T00:00:00Z":
+            to_date = max(to_date, stmt_to_date)
+
+        stmt_fx_rates: dict[str, Decimal] = {"EUR": Decimal("1")}
 
         # 1. Parse Trades (skip internal CASH FX conversions and zero-cash entries)
         for trade in getattr(stmt, "Trades", ()):
             asset_cat = _enum_name(getattr(trade, "assetCategory", "")).upper()
             if asset_cat == "CASH":
+                sym_str = str(getattr(trade, "symbol", "") or "").strip().upper()
+                tr_price = _to_decimal(getattr(trade, "tradePrice", None))
+                if sym_str.startswith("EUR.") and tr_price > Decimal("0"):
+                    stmt_fx_rates.setdefault(
+                        sym_str.split(".", 1)[1],
+                        Decimal("1") / tr_price,
+                    )
                 continue
             symbol = str(getattr(trade, "symbol", "") or "").strip()
             isin = str(
@@ -168,6 +198,9 @@ def parse_flex_xml(xml_bytes: bytes) -> IBKRStatementData:
             dt_val = getattr(trade, "dateTime", None) or getattr(trade, "tradeDate", None)
             timestamp = _format_iso_timestamp(dt_val)
             currency = str(getattr(trade, "currency", "EUR") or "EUR")
+            fx_rate_trade = _to_decimal(getattr(trade, "fxRateToBase", None), default="1")
+            if fx_rate_trade <= Decimal("0"):
+                fx_rate_trade = Decimal("1")
 
             trades.append(
                 IBKRTradeEvent(
@@ -180,10 +213,47 @@ def parse_flex_xml(xml_bytes: bytes) -> IBKRStatementData:
                     net_cash=net_cash,
                     currency=currency,
                     timestamp=timestamp,
+                    fx_rate_to_base=fx_rate_trade,
                 )
             )
 
-        # 2. Parse CashTransactions (Dividends & Interest; skip Deposits/Withdrawals)
+        # 2. Parse OpenPositions market value first so fxRateToBase rates are known
+        for pos in getattr(stmt, "OpenPositions", ()):
+            pos_symbol = str(getattr(pos, "symbol", "") or "").strip()
+            pos_isin = str(
+                getattr(pos, "isin", None) or getattr(pos, "securityID", None) or pos_symbol
+            ).strip()
+            pos_ccy = str(getattr(pos, "currency", "EUR") or "EUR").upper()
+            qty = _to_decimal(getattr(pos, "position", 0))
+            mark = _to_decimal(getattr(pos, "markPrice", 0))
+            fx_rate = _to_decimal(getattr(pos, "fxRateToBase", None), default="1")
+            if fx_rate <= Decimal("0"):
+                fx_rate = Decimal("1")
+            if pos_ccy != "EUR" and fx_rate != Decimal("1"):
+                stmt_fx_rates[pos_ccy] = fx_rate
+            if qty > Decimal("0"):
+                open_positions.append(
+                    IBKROpenPosition(
+                        symbol=pos_symbol,
+                        isin=pos_isin,
+                        currency=pos_ccy,
+                        quantity=qty,
+                        mark_price=mark,
+                        fx_rate_to_base=fx_rate,
+                    )
+                )
+
+            pos_val_in_base = _to_decimal(getattr(pos, "positionValueInBase", None))
+            if pos_val_in_base != Decimal("0"):
+                open_positions_value += pos_val_in_base
+                continue
+            pos_val = _to_decimal(getattr(pos, "positionValue", None))
+            if pos_val == Decimal("0"):
+                pos_val = qty * mark
+            pos_val *= fx_rate
+            open_positions_value += pos_val
+
+        # 3. Parse CashTransactions (Dividends & Interest; skip Deposits/Withdrawals)
         for cash_tx in getattr(stmt, "CashTransactions", ()):
             tx_type = _enum_name(getattr(cash_tx, "type", "")).lower()
             if "deposit" in tx_type or "withdrawal" in tx_type:
@@ -200,7 +270,11 @@ def parse_flex_xml(xml_bytes: bytes) -> IBKRStatementData:
             description = str(getattr(cash_tx, "description", "") or tx_type).strip()
             dt_val = getattr(cash_tx, "dateTime", None) or getattr(cash_tx, "reportDate", None)
             timestamp = _format_iso_timestamp(dt_val)
-            currency = str(getattr(cash_tx, "currency", "EUR") or "EUR")
+            currency = str(getattr(cash_tx, "currency", "EUR") or "EUR").upper()
+            raw_fx = _to_decimal(getattr(cash_tx, "fxRateToBase", None), default="0")
+            fx_rate_cash = (
+                raw_fx if raw_fx > Decimal("0") else stmt_fx_rates.get(currency, Decimal("1"))
+            )
 
             cash_events.append(
                 IBKRCashEvent(
@@ -212,24 +286,9 @@ def parse_flex_xml(xml_bytes: bytes) -> IBKRStatementData:
                     currency=currency,
                     description=description,
                     timestamp=timestamp,
+                    fx_rate_to_base=fx_rate_cash,
                 )
             )
-
-        # 3. Parse OpenPositions market value (converted to base currency via fxRateToBase)
-        for pos in getattr(stmt, "OpenPositions", ()):
-            pos_val_in_base = _to_decimal(getattr(pos, "positionValueInBase", None))
-            if pos_val_in_base != Decimal("0"):
-                open_positions_value += pos_val_in_base
-                continue
-            pos_val = _to_decimal(getattr(pos, "positionValue", None))
-            if pos_val == Decimal("0"):
-                qty = _to_decimal(getattr(pos, "position", 0))
-                mark = _to_decimal(getattr(pos, "markPrice", 0))
-                pos_val = qty * mark
-            fx_rate = _to_decimal(getattr(pos, "fxRateToBase", None), default="1")
-            if fx_rate > Decimal("0"):
-                pos_val *= fx_rate
-            open_positions_value += pos_val
 
         # 4. Parse CashReport ending cash
         for cash_rep in getattr(stmt, "CashReport", ()):
@@ -248,6 +307,51 @@ def parse_flex_xml(xml_bytes: bytes) -> IBKRStatementData:
         cash_events=cash_events,
         open_positions_value=open_positions_value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
         ending_cash=ending_cash.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+        open_positions=open_positions,
+        to_date=to_date,
+    )
+
+
+def merge_statement_data(statements: Sequence[IBKRStatementData]) -> IBKRStatementData:
+    """Merge multiple chronological IBKR statements, deduplicating trades/cash events."""
+    if not statements:
+        raise FlexWebServiceError("No IBKR statements provided to merge")
+    if len(statements) == 1:
+        return statements[0]
+
+    ordered = sorted(
+        statements,
+        key=lambda s: (
+            s.to_date or max((t.timestamp for t in s.trades), default=""),
+            len(s.trades) + len(s.cash_events),
+        ),
+    )
+    seen_trade_ids: set[str] = set()
+    merged_trades: list[IBKRTradeEvent] = []
+    seen_cash_ids: set[str] = set()
+    merged_cash: list[IBKRCashEvent] = []
+
+    for stmt in ordered:
+        for trade in stmt.trades:
+            if trade.trade_id not in seen_trade_ids:
+                seen_trade_ids.add(trade.trade_id)
+                merged_trades.append(trade)
+        for cash_ev in stmt.cash_events:
+            if cash_ev.transaction_id not in seen_cash_ids:
+                seen_cash_ids.add(cash_ev.transaction_id)
+                merged_cash.append(cash_ev)
+
+    merged_trades.sort(key=lambda t: (t.timestamp, t.trade_id))
+    merged_cash.sort(key=lambda c: (c.timestamp, c.transaction_id))
+    latest = ordered[-1]
+    return IBKRStatementData(
+        account_id=latest.account_id or ordered[0].account_id,
+        trades=merged_trades,
+        cash_events=merged_cash,
+        open_positions_value=latest.open_positions_value,
+        ending_cash=latest.ending_cash,
+        open_positions=latest.open_positions,
+        to_date=latest.to_date,
     )
 
 

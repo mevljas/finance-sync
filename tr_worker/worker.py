@@ -17,12 +17,14 @@ from shared.budgetbakers import (
     BudgetBakersClient,
     CreateRecordPayload,
 )
+from shared.couchdb import CouchDBStockSyncClient, load_delete_file
 from shared.database import DeduplicationStore, SeenRecordEntry, compute_record_hash
 
 from tr_worker.event_parser import (
     ParsedTRRecord,
-    TRRecordKind,
+    parse_tr_live_positions,
     parse_tr_portfolio_value,
+    parse_tr_stock_trades,
     parse_tr_timeline_events,
 )
 from tr_worker.session_manager import Discord2FAClient, TRSessionManager
@@ -62,6 +64,7 @@ class TRWorker:
         db: DeduplicationStore,
         bb_client: BudgetBakersClient,
         session_manager: TRSessionManager | None = None,
+        couchdb_client: CouchDBStockSyncClient | None = None,
     ) -> None:
         self.settings = settings
         self.db = db
@@ -83,61 +86,81 @@ class TRWorker:
                 discord_client=discord_client,
                 use_mock_data=settings.use_mock_data,
             )
+        self._owns_couchdb_client = couchdb_client is None and settings.has_couchdb
+        if couchdb_client is not None:
+            self.couchdb_client: CouchDBStockSyncClient | None = couchdb_client
+        elif settings.has_couchdb:
+            self.couchdb_client = CouchDBStockSyncClient(
+                owner_id=settings.bb_couchdb_user,
+                password=settings.bb_couchdb_password.get_secret_value(),
+                base_url=settings.bb_couchdb_url,
+                dry_run=settings.dry_run or bb_client.dry_run,
+                use_mock_data=settings.use_mock_data,
+            )
+        else:
+            self.couchdb_client = None
 
     def close(self) -> None:
-        """Close owned Discord 2FA HTTP client resources."""
+        """Close owned Discord 2FA and CouchDB HTTP client resources."""
         if self._owns_session_manager:
             self.session_manager.discord_client.close()
+        if self._owns_couchdb_client and self.couchdb_client is not None:
+            self.couchdb_client.close()
 
     def _reconcile_backfill(
         self,
         parsed_records: list[ParsedTRRecord],
         *,
         is_dry_run: bool = False,
+        purge_existing_records: bool = False,
+        file_record_ids: list[str] | None = None,
     ) -> tuple[int, set[str]]:
-        """Delete manual -50 EUR savings plans once and seed existing manual interest."""
-        if self.db.get_metadata(BACKFILL_META_KEY) == "true":
-            return 0, set()
-
-        logger.info("Running one-time Trade Republic historical backfill reconciliation...")
-        # 1. Find and delete manual -50 EUR "Savings plan" placeholder records on TR cash account
-        existing_inv = self.bb_client.get_records(
-            account_id=self.settings.bb_tr_cash_account_id,
-            category_id=self.settings.bb_category_investments,
-            record_date_gte="2024-01-01T00:00:00Z",
-        )
-        legacy_ids: list[str] = []
-        for rec in existing_inv:
-            rec_id = str(rec.get("id") or "")
-            note = str(rec.get("note") or "")
-            amt_val = float((rec.get("amount") or {}).get("value") or 0.0)
-            if rec_id and amt_val == -50.0 and "sh " not in note:
-                legacy_ids.append(rec_id)
-
+        """Delete requested records and seed existing Wallet records on initial sync."""
+        deleted_id_set: set[str] = set()
         deleted_count = 0
-        if legacy_ids:
-            deleted_count = self.bb_client.delete_records(legacy_ids)
-            logger.info("Deleted %d legacy manual Savings plan placeholder records", deleted_count)
+        if purge_existing_records:
+            existing_cash = self.bb_client.get_records(self.settings.bb_tr_cash_account_id)
+            existing_wealth = self.bb_client.get_records(self.settings.bb_tr_wealth_account_id)
+            purge_ids = [
+                str(rec["id"])
+                for rec in (*existing_cash, *existing_wealth)
+                if rec.get("id") is not None
+            ]
+            if purge_ids:
+                deleted_id_set.update(purge_ids)
+                deleted_count = self.bb_client.delete_records(purge_ids)
+        elif file_record_ids:
+            deleted_id_set.update(file_record_ids)
+            deleted_count = self.bb_client.delete_records(file_record_ids)
 
-        # 2. Match existing manual Interest records on TR cash account (±3 days + same amount)
-        existing_interest: list[dict[str, Any]] = self.bb_client.get_records(
+        if (
+            self.db.get_metadata(BACKFILL_META_KEY) == "true"
+            and self.db.count(self.BROKER_NAME) > 0
+        ):
+            return deleted_count, set()
+
+        logger.info("Running initial Trade Republic existing-record seeding...")
+        existing_records: list[dict[str, Any]] = self.bb_client.get_records(
             account_id=self.settings.bb_tr_cash_account_id,
-            category_id=self.settings.bb_category_interest_dividends,
             record_date_gte="2024-01-01T00:00:00Z",
         )
         seed_entries: list[SeenRecordEntry] = []
         seeded_hashes: set[str] = set()
+        used_existing_ids: set[str] = set(deleted_id_set)
         for candidate in parsed_records:
-            if candidate.kind != TRRecordKind.INTEREST:
-                continue
             cand_dt = _parse_iso(candidate.timestamp)
-            for existing in existing_interest:
+            for existing in existing_records:
+                ex_id = str(existing.get("id") or "")
+                if ex_id and ex_id in used_existing_ids:
+                    continue
                 ex_amt = round(float((existing.get("amount") or {}).get("value") or 0.0), 2)
                 ex_date_str = str(existing.get("recordDate") or "")
                 if not ex_date_str:
                     continue
                 ex_dt = _parse_iso(ex_date_str)
                 if ex_amt == candidate.amount and abs(cand_dt - ex_dt) <= timedelta(days=3):
+                    if ex_id:
+                        used_existing_ids.add(ex_id)
                     rec_hash = compute_record_hash(
                         self.BROKER_NAME,
                         candidate.external_id,
@@ -156,8 +179,7 @@ class TRWorker:
 
         if is_dry_run:
             logger.info(
-                "[DRY_RUN] Would seed %d existing manual Trade Republic interest records "
-                "and set %s=true in SQLite",
+                "[DRY_RUN] Would seed %d existing Trade Republic records and set %s=true in SQLite",
                 len(seed_entries),
                 BACKFILL_META_KEY,
             )
@@ -166,22 +188,30 @@ class TRWorker:
         if seed_entries:
             self.db.mark_seen_batch(seed_entries)
             logger.info(
-                "Seeded %d existing manual Trade Republic interest records into seen_records",
+                "Seeded %d existing Trade Republic records into seen_records",
                 len(seed_entries),
             )
 
         self.db.set_metadata(BACKFILL_META_KEY, "true")
         return deleted_count, seeded_hashes
 
-    def sync_once(self) -> TRSyncSummary:
+    def sync_once(
+        self,
+        *,
+        purge_existing_records: bool = False,
+        delete_file: Path | None = None,
+    ) -> TRSyncSummary:
         """Run a single Trade Republic sync and portfolio balance update cycle."""
         is_dry_run = self.settings.dry_run or self.bb_client.dry_run
+        file_record_ids, couch_delete_ids = load_delete_file(delete_file)
         raw_events, raw_portfolio = self.session_manager.fetch_timeline_and_portfolio()
         parsed_records = parse_tr_timeline_events(raw_events, self.settings)
 
         deleted_legacy, ephemeral_seeded_hashes = self._reconcile_backfill(
             parsed_records,
             is_dry_run=is_dry_run,
+            purge_existing_records=purge_existing_records,
+            file_record_ids=file_record_ids,
         )
 
         records_to_create: list[CreateRecordPayload] = []
@@ -221,13 +251,27 @@ class TRWorker:
                 len(seen_entries),
             )
 
-        portfolio_value = parse_tr_portfolio_value(raw_portfolio)
         patched_initial: float | None = None
-        if portfolio_value > 0:
+        if self.couchdb_client is not None:
+            self.couchdb_client.sync_account_holdings(
+                broker=self.BROKER_NAME,
+                account_id=self.settings.bb_tr_wealth_account_id,
+                trades=parse_tr_stock_trades(raw_events),
+                live_positions=parse_tr_live_positions(raw_portfolio),
+                purge_existing=purge_existing_records,
+                delete_doc_ids=couch_delete_ids,
+            )
             patched_initial = self.bb_client.update_account_target_balance(
                 account_id=self.settings.bb_tr_wealth_account_id,
-                target_balance=float(portfolio_value),
+                target_balance=0.0,
             )
+        else:
+            portfolio_value = parse_tr_portfolio_value(raw_portfolio)
+            if portfolio_value > 0:
+                patched_initial = self.bb_client.update_account_target_balance(
+                    account_id=self.settings.bb_tr_wealth_account_id,
+                    target_balance=float(portfolio_value),
+                )
 
         logger.info(
             "TR sync complete (dry_run=%s): created=%d, duplicates=%d, "
@@ -275,6 +319,17 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Write JSON dry-run preview report to file (implies --dry-run)",
     )
+    parser.add_argument(
+        "--purge-account-records",
+        action="store_true",
+        help="Delete all existing records on TR accounts before syncing",
+    )
+    parser.add_argument(
+        "--delete-file",
+        type=Path,
+        default=None,
+        help="Path to JSON file listing specific record_ids and couchdb_doc_ids to delete",
+    )
     args = parser.parse_args(argv)
 
     settings = get_settings()
@@ -294,8 +349,16 @@ def main(argv: list[str] | None = None) -> int:
     ) as bb_client:
         worker = TRWorker(settings=settings, db=db, bb_client=bb_client)
         try:
-            if args.once or args.dry_run_output is not None:
-                summary = worker.sync_once()
+            if (
+                args.once
+                or args.dry_run_output is not None
+                or args.purge_account_records
+                or args.delete_file is not None
+            ):
+                summary = worker.sync_once(
+                    purge_existing_records=args.purge_account_records,
+                    delete_file=args.delete_file,
+                )
                 if args.dry_run_output is not None:
                     report: dict[str, Any] = {
                         "broker": TRWorker.BROKER_NAME,
@@ -311,6 +374,16 @@ def main(argv: list[str] | None = None) -> int:
                         "would_delete_record_ids": bb_client.dry_run_deleted_ids,
                         "would_create_records": bb_client.dry_run_created,
                         "would_patch_accounts": bb_client.dry_run_patched_accounts,
+                        "would_upsert_couchdb_docs": (
+                            worker.couchdb_client.dry_run_upserted_docs
+                            if worker.couchdb_client is not None
+                            else []
+                        ),
+                        "would_delete_couchdb_doc_ids": (
+                            worker.couchdb_client.dry_run_deleted_ids
+                            if worker.couchdb_client is not None
+                            else []
+                        ),
                     }
                     args.dry_run_output.parent.mkdir(parents=True, exist_ok=True)
                     args.dry_run_output.write_text(

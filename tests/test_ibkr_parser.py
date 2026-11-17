@@ -3,17 +3,23 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from pathlib import Path
 
 import httpx
 import pytest
 import respx
+from config.settings import Settings
 from ibkr_worker.flex_client import (
     FLEX_GET_STATEMENT_URL,
     FLEX_SEND_REQUEST_URL,
     FlexClient,
     FlexWebServiceError,
+    merge_statement_data,
     parse_flex_xml,
 )
+from ibkr_worker.worker import IBKRWorker, main
+from shared.budgetbakers import BudgetBakersClient
+from shared.database import DeduplicationStore
 from shared.mock_data import load_mock_ibkr_xml
 
 
@@ -185,3 +191,103 @@ def test_flex_client_raises_on_error_status() -> None:
         pytest.raises(FlexWebServiceError, match="1012"),
     ):
         client.send_request()
+
+
+def test_merge_statement_data_deduplicates_and_uses_latest_positions(
+    test_settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify merging 2025.xml and 2026.xml deduplicates trades and uses latest OpenPositions."""
+    xml_2025 = (
+        b'<FlexQueryResponse queryName="ActivityFlexQuery" type="AF">\n'
+        b'  <FlexStatements count="1">\n'
+        b'    <FlexStatement accountId="DU0000000" fromDate="2025-01-01" toDate="2025-12-31"\n'
+        b'                   period="" whenGenerated="2026-11-15;12:00:00">\n'
+        b"      <CashReport>\n"
+        b'        <CashReportCurrency accountId="DU0000000" currency="BASE_SUMMARY"\n'
+        b'                            endingCash="5000.00" endingSettledCash="5000.00" />\n'
+        b"      </CashReport>\n"
+        b"      <OpenPositions>\n"
+        b'        <OpenPosition accountId="DU0000000" assetCategory="STK" symbol="FAKE"\n'
+        b'                      isin="XF0000000001" currency="EUR" fxRateToBase="1"\n'
+        b'                      position="10" markPrice="100.00" positionValue="1000.00" />\n'
+        b"      </OpenPositions>\n"
+        b"      <Trades>\n"
+        b'        <Trade accountId="DU0000000" assetCategory="STK" symbol="FAKE"\n'
+        b'               isin="XF0000000001" currency="EUR" tradeID="TRD-2025"\n'
+        b'               dateTime="20250615;10:00:00" buySell="BUY" quantity="10"\n'
+        b'               tradePrice="100.00" netCash="-1001.00" />\n'
+        b"      </Trades>\n"
+        b"    </FlexStatement>\n"
+        b"  </FlexStatements>\n"
+        b"</FlexQueryResponse>"
+    )
+    xml_2026 = (
+        b'<FlexQueryResponse queryName="ActivityFlexQuery" type="AF">\n'
+        b'  <FlexStatements count="1">\n'
+        b'    <FlexStatement accountId="DU0000000" fromDate="2025-06-01" toDate="2026-11-15"\n'
+        b'                   period="" whenGenerated="2026-11-15;12:00:00">\n'
+        b"      <CashReport>\n"
+        b'        <CashReportCurrency accountId="DU0000000" currency="BASE_SUMMARY"\n'
+        b'                            endingCash="250.00" endingSettledCash="250.00" />\n'
+        b"      </CashReport>\n"
+        b"      <OpenPositions>\n"
+        b'        <OpenPosition accountId="DU0000000" assetCategory="STK" symbol="FAKE"\n'
+        b'                      isin="XF0000000001" currency="EUR" fxRateToBase="1"\n'
+        b'                      position="15" markPrice="120.00" positionValue="1800.00" />\n'
+        b"      </OpenPositions>\n"
+        b"      <Trades>\n"
+        b'        <Trade accountId="DU0000000" assetCategory="STK" symbol="FAKE"\n'
+        b'               isin="XF0000000001" currency="EUR" tradeID="TRD-2025"\n'
+        b'               dateTime="20250615;10:00:00" buySell="BUY" quantity="10"\n'
+        b'               tradePrice="100.00" netCash="-1001.00" />\n'
+        b'        <Trade accountId="DU0000000" assetCategory="STK" symbol="FAKE"\n'
+        b'               isin="XF0000000001" currency="EUR" tradeID="TRD-2026"\n'
+        b'               dateTime="20260615;10:00:00" buySell="BUY" quantity="5"\n'
+        b'               tradePrice="110.00" netCash="-551.00" />\n'
+        b"      </Trades>\n"
+        b"    </FlexStatement>\n"
+        b"  </FlexStatements>\n"
+        b"</FlexQueryResponse>"
+    )
+
+    xml_dir = tmp_path / "xml_inputs"
+    xml_dir.mkdir()
+    f_2025 = xml_dir / "2025.xml"
+    f_2026 = xml_dir / "2026.xml"
+    f_2025.write_bytes(xml_2025)
+    f_2026.write_bytes(xml_2026)
+
+    merged = merge_statement_data([parse_flex_xml(xml_2026), parse_flex_xml(xml_2025)])
+    assert [t.trade_id for t in merged.trades] == ["TRD-2025", "TRD-2026"]
+    assert merged.ending_cash == Decimal("250.00")
+    assert merged.open_positions_value == Decimal("1800.00")
+    assert len(merged.open_positions) == 1
+    assert merged.open_positions[0].quantity == Decimal("15")
+
+    db = DeduplicationStore(tmp_path / "xml_test.db")
+    with BudgetBakersClient(token="test-token", dry_run=True, use_mock_data=True) as bb_client:
+        worker = IBKRWorker(
+            settings=test_settings.model_copy(update={"dry_run": True, "use_mock_data": True}),
+            db=db,
+            bb_client=bb_client,
+            xml_paths=[xml_dir],
+        )
+        try:
+            summary = worker.sync_once()
+            assert summary.trades_synced == 2
+        finally:
+            worker.close()
+
+    monkeypatch.setenv("SQLITE_DB_PATH", str(tmp_path / "cli_test.db"))
+    monkeypatch.setenv("USE_MOCK_DATA", "true")
+    exit_code = main(
+        [
+            "--xml-file",
+            str(f_2025),
+            str(f_2026),
+            "--dry-run",
+        ]
+    )
+    assert exit_code == 0

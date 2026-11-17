@@ -19,14 +19,14 @@ Managing personal finances across multiple European brokers and fintech platform
 - **Portfolio Valuation (`OpenPositions` + `CashReport`)**: Patched onto `BB_IBKR_ACCOUNT_ID` via `PATCH /v1/api/accounts` by adjusting `initialBalance` so `currentBalance` equals total live portfolio value.
 
 ### 3.2 Trade Republic (`BB_TR_CASH_ACCOUNT_ID` & `BB_TR_WEALTH_ACCOUNT_ID`)
-- **Card Payments**: Logged as `expense` records on `BB_TR_CASH_ACCOUNT_ID` for events after `TR_CARD_CUTOFF_DATE` (`2026-11-01T09:00:00Z`), categorized automatically using merchant keyword + MCC rules with fallback to `Unknown expense` (`5c5c32c9-0082-8000-8000-000000000000`).
-- **Monthly Interest**: Logged as `income` (`Interest, dividends`) on `BB_TR_CASH_ACCOUNT_ID`. During initial backfill, existing manual interest entries in Wallet are matched by `(amount, date ±3 days)` so they are not duplicated while missing historical months are created.
+- **Card Payments**: Logged as `expense` records on `BB_TR_CASH_ACCOUNT_ID` for events after `TR_CARD_CUTOFF_DATE`, categorized automatically using merchant keyword + MCC rules with fallback to `Unknown expense` (`5c5c32c9-0082-8000-8000-000000000000`).
+- **Monthly Interest**: Logged as `income` (`Interest, dividends`) on `BB_TR_CASH_ACCOUNT_ID`. During initial backfill, existing records in Wallet are matched by `(amount, date ±3 days)` so they are seeded into `seen_records` and not duplicated.
 - **SEPA Cash Deposits/Withdrawals**: Logged on `BB_TR_CASH_ACCOUNT_ID` under category `Transfer` (`5c5c4e21-00c8-8000-8000-000000000000`).
-- **1% Saveback**: Logged as bonus `income` (`Interest, dividends`) on `BB_TR_WEALTH_ACCOUNT_ID` with executed shares, ISIN, and price in `note`.
+- **1% Saveback**: Synced as a native `-AssetTransaction` stock purchase in CouchDB on `BB_TR_WEALTH_ACCOUNT_ID` when CouchDB is configured (or as a REST `Interest, dividends` record otherwise).
 - **Savings Plans & Stock Buys**:
-  - During initial backfill, deletes existing placeholder `-50 EUR` `"Savings plan"` entries on `BB_TR_CASH_ACCOUNT_ID` (via `DELETE /v1/api/records`) once.
-  - Deducts the cash amount as an `expense` (`Fin. investments`) on `BB_TR_CASH_ACCOUNT_ID` AND logs the stock buy record (`Fin. investments`, with executed shares, ISIN, and price in `note`) on `BB_TR_WEALTH_ACCOUNT_ID`.
-- **Portfolio Valuation**: Patched onto `BB_TR_WEALTH_ACCOUNT_ID` via `PATCH /v1/api/accounts` so `currentBalance` equals live TR security portfolio market value.
+  - Supports deleting all existing records on the account (`--purge-account-records`) or deleting specific record/CouchDB IDs from a local gitignored JSON file (`--delete-file <path.json>`).
+  - Creates a paired `Transfer` (`transfer.pairingMode = "new"`) from `BB_TR_CASH_ACCOUNT_ID` to `BB_TR_WEALTH_ACCOUNT_ID` and syncs the stock purchase as an `-AssetTransaction` in CouchDB when CouchDB is configured (or logs REST `Fin. investments` records otherwise).
+- **Portfolio Valuation**: Reconciles `BB_TR_WEALTH_ACCOUNT_ID` uninvested cash balance to `0.00 EUR` when CouchDB tracks stock holdings (or patches total live portfolio market value onto `BB_TR_WEALTH_ACCOUNT_ID` via `PATCH /v1/api/accounts` in REST-only mode).
 
 ## 4. Non-Functional Requirements
 - **Zero Secrets**: No credentials or personal UUIDs in git history.
