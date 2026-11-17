@@ -28,9 +28,11 @@ Additionally, for Trade Republic Savings Plans, the outgoing cash deduction on `
    - `1% Saveback` is paid directly in fractional shares by Trade Republic and does not deduct from `BB_TR_CASH_ACCOUNT_ID`, so it is written exclusively as a CouchDB `-AssetTransaction` on `BB_TR_WEALTH_ACCOUNT_ID`.
 
 3. **Uninvested Cash Balance Reconciliation**:
-   - Because CouchDB `-AssetTransaction` documents automatically track the market value of the stock holdings in Wallet, the REST account cash balance (`PATCH /v1/api/accounts`) reconciles only the **uninvested cash balance** when `settings.has_couchdb == True`:
-     - `BB_IBKR_ACCOUNT_ID`: Reconciled to `statement.ending_cash` (settled uninvested cash in EUR).
-     - `BB_TR_WEALTH_ACCOUNT_ID`: Reconciled to `0.00 EUR` (offsetting the incoming transfer mirrors that were immediately invested into stocks).
+   - BudgetBakers Wallet's web/mobile UI computes an investment account's cash balance by subtracting all CouchDB `BUY` `-AssetTransaction.cashAmount` entries (and adding `SELL` entries) from the REST formula (`initial + totalIncomes - totalExpenses`).
+   - Therefore, when `settings.has_couchdb == True`, `PATCH /v1/api/accounts` sets the REST target balance to `uninvested_cash + net_cash_invested_eur` so the displayed Cash balance in Wallet matches live broker settled cash (`ending_cash` for IBKR; `0.00 EUR` for `BB_TR_WEALTH_ACCOUNT_ID`) while Wallet adds live stock value automatically:
+     - `BB_IBKR_ACCOUNT_ID`: Reconciled to `statement.ending_cash + net_cash_invested_eur`.
+     - `BB_TR_WEALTH_ACCOUNT_ID`: Reconciled to `0.00 EUR + net_cash_invested_eur`.
+     - `BB_TR_CASH_ACCOUNT_ID`: Reconciled to live Trade Republic cash balance (`cashBalance` from `api.cash()`) when available.
    - When `settings.has_couchdb == False`, the legacy REST-only behavior is preserved for backward compatibility.
 
 ## Consequences

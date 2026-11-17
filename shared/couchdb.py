@@ -83,6 +83,7 @@ class CouchDBSyncResult:
     assets_created: int
     transactions_upserted: int
     transactions_deleted: int
+    net_cash_invested_eur: float = 0.0
 
 
 def _normalize_couch_iso(ts: str) -> str:
@@ -469,8 +470,17 @@ class CouchDBStockSyncClient:
                 )
                 self.dry_run_deleted_ids.append(asset_del_id)
 
+        net_cash_cents = 0
+        for doc in desired_tx_docs.values():
+            cents = int(doc.get("cashAmount") or 0)
+            if int(doc.get("transactionType", 0)) == 1:
+                net_cash_cents -= cents
+            else:
+                net_cash_cents += cents
+        net_cash_invested_eur = round(net_cash_cents / 100.0, 2)
+
         if not docs_to_write:
-            return CouchDBSyncResult(0, 0, 0)
+            return CouchDBSyncResult(0, 0, 0, net_cash_invested_eur=net_cash_invested_eur)
 
         if self.dry_run:
             for d in docs_to_write:
@@ -478,16 +488,18 @@ class CouchDBStockSyncClient:
                     self.dry_run_upserted_docs.append(d)
             logger.info(
                 "[DRY_RUN] CouchDB account=%s: would create %d assets, upsert %d "
-                "AssetTransactions, delete %d superseded AssetTransactions",
+                "AssetTransactions, delete %d superseded AssetTransactions (net_cash_eur=%.2f)",
                 account_id,
                 assets_created,
                 transactions_upserted,
                 transactions_deleted,
+                net_cash_invested_eur,
             )
             return CouchDBSyncResult(
                 assets_created=assets_created,
                 transactions_upserted=transactions_upserted,
                 transactions_deleted=transactions_deleted,
+                net_cash_invested_eur=net_cash_invested_eur,
             )
 
         resp = self._client.post(
@@ -497,14 +509,16 @@ class CouchDBStockSyncClient:
         resp.raise_for_status()
         logger.info(
             "CouchDB sync complete for account=%s: assets_created=%d, "
-            "tx_upserted=%d, tx_deleted=%d",
+            "tx_upserted=%d, tx_deleted=%d (net_cash_eur=%.2f)",
             account_id,
             assets_created,
             transactions_upserted,
             transactions_deleted,
+            net_cash_invested_eur,
         )
         return CouchDBSyncResult(
             assets_created=assets_created,
             transactions_upserted=transactions_upserted,
             transactions_deleted=transactions_deleted,
+            net_cash_invested_eur=net_cash_invested_eur,
         )

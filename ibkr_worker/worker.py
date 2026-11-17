@@ -171,6 +171,7 @@ class IBKRWorker:
         cash_events_synced = 0
         skipped_duplicates = 0
 
+        net_couch_cash_eur = 0.0
         if self.couchdb_client is not None:
             couch_trades = [
                 StockTradeInput(
@@ -206,6 +207,7 @@ class IBKRWorker:
                 delete_doc_ids=couch_delete_ids,
             )
             trades_synced = couch_result.transactions_upserted
+            net_couch_cash_eur = couch_result.net_cash_invested_eur
         else:
             for trade in statement.trades:
                 amount_float = round(float(trade.net_cash), 2)
@@ -323,9 +325,11 @@ class IBKRWorker:
 
         patched_initial: float | None = None
         if self.couchdb_client is not None:
+            # Wallet UI subtracts BUY AssetTransaction cashAmount from REST currentBalance,
+            # so REST target_balance must include net_couch_cash_eur to keep settled cash exact.
             patched_initial = self.bb_client.update_account_target_balance(
                 account_id=self.settings.bb_ibkr_account_id,
-                target_balance=float(statement.ending_cash),
+                target_balance=round(float(statement.ending_cash) + net_couch_cash_eur, 2),
             )
         elif statement.total_portfolio_value > 0:
             patched_initial = self.bb_client.update_account_target_balance(

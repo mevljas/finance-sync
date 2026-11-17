@@ -158,6 +158,7 @@ def test_couchdb_sync_account_holdings_upserts_and_deletes_superseded() -> None:
     assert result.assets_created == 1  # GOOG created, VWCE matched existing
     assert result.transactions_upserted == 3  # 2 trades + 1 VWCE baseline (150.3547 sh)
     assert result.transactions_deleted == 1  # old manual web transaction deleted
+    assert result.net_cash_invested_eur > 0
     assert len(bulk_payloads) == 1
     docs = bulk_payloads[0]["docs"]
     deleted_docs = [d for d in docs if d.get("_deleted")]

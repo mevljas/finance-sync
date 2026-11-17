@@ -253,7 +253,7 @@ class TRWorker:
 
         patched_initial: float | None = None
         if self.couchdb_client is not None:
-            self.couchdb_client.sync_account_holdings(
+            couch_result = self.couchdb_client.sync_account_holdings(
                 broker=self.BROKER_NAME,
                 account_id=self.settings.bb_tr_wealth_account_id,
                 trades=parse_tr_stock_trades(raw_events),
@@ -261,9 +261,11 @@ class TRWorker:
                 purge_existing=purge_existing_records,
                 delete_doc_ids=couch_delete_ids,
             )
+            # Wallet UI subtracts BUY AssetTransaction cashAmount from REST currentBalance,
+            # so REST target_balance must offset net_cash_invested_eur to keep cash = 0.00.
             patched_initial = self.bb_client.update_account_target_balance(
                 account_id=self.settings.bb_tr_wealth_account_id,
-                target_balance=0.0,
+                target_balance=round(couch_result.net_cash_invested_eur, 2),
             )
         else:
             portfolio_value = parse_tr_portfolio_value(raw_portfolio)
@@ -272,6 +274,13 @@ class TRWorker:
                     account_id=self.settings.bb_tr_wealth_account_id,
                     target_balance=float(portfolio_value),
                 )
+
+        raw_cash_balance = raw_portfolio.get("cashBalance")
+        if raw_cash_balance is not None and float(raw_cash_balance) >= 0.0:
+            self.bb_client.update_account_target_balance(
+                account_id=self.settings.bb_tr_cash_account_id,
+                target_balance=round(float(raw_cash_balance), 2),
+            )
 
         logger.info(
             "TR sync complete (dry_run=%s): created=%d, duplicates=%d, "

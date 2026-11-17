@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import re
@@ -325,6 +326,21 @@ class TRSessionManager:
                     for pos in positions:
                         net_val += float(pos.get("marketValue") or 0.0)
                 portfolio_data = {"netValue": round(net_val, 2), "positions": positions}
+
+            cash_fn = getattr(api, "cash", None)
+            if callable(cash_fn):
+                with contextlib.suppress(Exception):
+                    await cash_fn()
+                    _, _, cash_resp = await api.recv()
+                    if isinstance(cash_resp, list) and cash_resp:
+                        total_cash = sum(
+                            float(item.get("amount") or 0.0)
+                            for item in cash_resp
+                            if isinstance(item, dict)
+                        )
+                        portfolio_data["cashBalance"] = round(total_cash, 2)
+                    elif isinstance(cash_resp, dict) and "amount" in cash_resp:
+                        portfolio_data["cashBalance"] = round(float(cash_resp["amount"]), 2)
 
             return timeline_events, portfolio_data
         finally:
