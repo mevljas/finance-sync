@@ -235,7 +235,7 @@ class Settings(BaseSettings):
         alias="TR_CARD_CUTOFF_DATE",
     )
 
-    # Discord Bot (2FA Renewal)
+    # Discord Bot (2FA Renewal & Optional Error Notifications)
     discord_bot_token: SecretStr = Field(
         default=SecretStr("mock-discord-bot-token"),
         alias="DISCORD_BOT_TOKEN",
@@ -252,6 +252,30 @@ class Settings(BaseSettings):
         default=3.0,
         alias="DISCORD_2FA_POLL_INTERVAL_SECONDS",
     )
+
+    @property
+    def has_discord(self) -> bool:
+        """Return True when non-placeholder Discord Bot credentials are configured."""
+        bot_secret = self.discord_bot_token.get_secret_value().strip()
+        channel = self.discord_channel_id.strip()
+        default_placeholder = "mock-discord-bot-token"
+        return bool(
+            bot_secret
+            and bot_secret != default_placeholder
+            and channel
+            and channel != "000000000000000000"
+        )
+
+    def secret_values(self) -> tuple[str, ...]:
+        """Return configured secret strings for masking in logs and alerts."""
+        candidates = (
+            self.budgetbakers_token.get_secret_value(),
+            self.bb_couchdb_password.get_secret_value(),
+            self.ibkr_flex_token.get_secret_value(),
+            self.discord_bot_token.get_secret_value(),
+            self.tr_pin.get_secret_value(),
+        )
+        return tuple(val for val in candidates if val and len(val) >= 6)
 
     def resolve_merchant_category(
         self,

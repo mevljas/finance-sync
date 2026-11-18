@@ -18,6 +18,7 @@ from shared.budgetbakers import (
 )
 from shared.couchdb import CouchDBStockSyncClient, load_delete_file
 from shared.database import DeduplicationStore, SeenRecordEntry, compute_record_hash
+from shared.discord import attach_discord_error_handler
 from shared.scheduler import parse_start_time, run_periodic_sync
 
 from tr_worker.event_parser import (
@@ -357,60 +358,65 @@ def main(argv: list[str] | None = None) -> int:
         level=getattr(logging, settings.log_level.upper(), logging.INFO),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    db = DeduplicationStore(settings.sqlite_db_path)
-    with BudgetBakersClient(
-        token=settings.budgetbakers_token.get_secret_value(),
-        base_url=settings.budgetbakers_base_url,
-        dry_run=settings.dry_run,
-        use_mock_data=settings.use_mock_data,
-    ) as bb_client:
-        worker = TRWorker(settings=settings, db=db, bb_client=bb_client)
+    with attach_discord_error_handler(settings, worker_name="Trade Republic"):
         try:
-            if (
-                args.once
-                or args.dry_run_output is not None
-                or args.purge_account_records
-                or args.delete_file is not None
-            ):
-                summary = worker.sync_once(
-                    purge_existing_records=args.purge_account_records,
-                    delete_file=args.delete_file,
-                )
-                if args.dry_run_output is not None:
-                    report: dict[str, Any] = {
-                        "broker": TRWorker.BROKER_NAME,
-                        "dry_run": summary.dry_run,
-                        "summary": {
-                            "records_created": summary.records_created,
-                            "skipped_duplicates": summary.skipped_duplicates,
-                            "deleted_legacy_savings": summary.deleted_legacy_savings,
-                            "patched_wealth_initial_balance": (
-                                summary.patched_wealth_initial_balance
-                            ),
-                        },
-                        "would_delete_record_ids": bb_client.dry_run_deleted_ids,
-                        "would_create_records": bb_client.dry_run_created,
-                        "would_patch_accounts": bb_client.dry_run_patched_accounts,
-                        "would_upsert_couchdb_docs": (
-                            worker.couchdb_client.dry_run_upserted_docs
-                            if worker.couchdb_client is not None
-                            else []
-                        ),
-                        "would_delete_couchdb_doc_ids": (
-                            worker.couchdb_client.dry_run_deleted_ids
-                            if worker.couchdb_client is not None
-                            else []
-                        ),
-                    }
-                    args.dry_run_output.parent.mkdir(parents=True, exist_ok=True)
-                    args.dry_run_output.write_text(
-                        json.dumps(report, indent=2),
-                        encoding="utf-8",
-                    )
-            else:
-                worker.run_forever()
-        finally:
-            worker.close()
+            db = DeduplicationStore(settings.sqlite_db_path)
+            with BudgetBakersClient(
+                token=settings.budgetbakers_token.get_secret_value(),
+                base_url=settings.budgetbakers_base_url,
+                dry_run=settings.dry_run,
+                use_mock_data=settings.use_mock_data,
+            ) as bb_client:
+                worker = TRWorker(settings=settings, db=db, bb_client=bb_client)
+                try:
+                    if (
+                        args.once
+                        or args.dry_run_output is not None
+                        or args.purge_account_records
+                        or args.delete_file is not None
+                    ):
+                        summary = worker.sync_once(
+                            purge_existing_records=args.purge_account_records,
+                            delete_file=args.delete_file,
+                        )
+                        if args.dry_run_output is not None:
+                            report: dict[str, Any] = {
+                                "broker": TRWorker.BROKER_NAME,
+                                "dry_run": summary.dry_run,
+                                "summary": {
+                                    "records_created": summary.records_created,
+                                    "skipped_duplicates": summary.skipped_duplicates,
+                                    "deleted_legacy_savings": summary.deleted_legacy_savings,
+                                    "patched_wealth_initial_balance": (
+                                        summary.patched_wealth_initial_balance
+                                    ),
+                                },
+                                "would_delete_record_ids": bb_client.dry_run_deleted_ids,
+                                "would_create_records": bb_client.dry_run_created,
+                                "would_patch_accounts": bb_client.dry_run_patched_accounts,
+                                "would_upsert_couchdb_docs": (
+                                    worker.couchdb_client.dry_run_upserted_docs
+                                    if worker.couchdb_client is not None
+                                    else []
+                                ),
+                                "would_delete_couchdb_doc_ids": (
+                                    worker.couchdb_client.dry_run_deleted_ids
+                                    if worker.couchdb_client is not None
+                                    else []
+                                ),
+                            }
+                            args.dry_run_output.parent.mkdir(parents=True, exist_ok=True)
+                            args.dry_run_output.write_text(
+                                json.dumps(report, indent=2),
+                                encoding="utf-8",
+                            )
+                    else:
+                        worker.run_forever()
+                finally:
+                    worker.close()
+        except Exception:
+            logger.exception("Trade Republic worker failed")
+            raise
     return 0
 
 

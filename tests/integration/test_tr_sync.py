@@ -244,3 +244,34 @@ def test_tr_worker_run_forever_and_cli_start_time(
     assert tr_main(["--start-time", "10:20:30"]) == 0
     assert captured["start_time"] == time(10, 20, 30)
     assert captured["timezone_name"] == "UTC"
+
+
+@respx.mock
+def test_tr_main_notifies_discord_on_sync_error_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Verify tr_worker main() sends a Discord alert on --once failure when configured."""
+    channel_id = "000000000000000001"
+    discord_route = respx.post(f"https://discord.com/api/v10/channels/{channel_id}/messages").mock(
+        return_value=httpx.Response(200, json={"id": "err-msg-2"})
+    )
+
+    monkeypatch.setenv("USE_MOCK_DATA", "false")
+    monkeypatch.setenv("DRY_RUN", "false")
+    monkeypatch.setenv("SQLITE_DB_PATH", str(tmp_path / "err_tr.db"))
+    monkeypatch.setenv("TR_SESSION_DIR", str(tmp_path / "tr_sess"))
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "real-bot-token")
+    monkeypatch.setenv("DISCORD_CHANNEL_ID", channel_id)
+    monkeypatch.setattr(
+        "tr_worker.worker.TRWorker.sync_once",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("TR WebSocket timeout")),
+    )
+
+    with pytest.raises(RuntimeError, match="TR WebSocket timeout"):
+        tr_main(["--once"])
+
+    assert discord_route.call_count == 1
+    body = json.loads(discord_route.calls[0].request.content)
+    assert "Trade Republic" in body["content"]
+    assert "TR WebSocket timeout" in body["content"]

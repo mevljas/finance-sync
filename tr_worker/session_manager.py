@@ -13,11 +13,11 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from shared.discord import DiscordAPIError, DiscordClient
 from shared.mock_data import load_mock_tr_portfolio, load_mock_tr_timeline
 
 logger = logging.getLogger(__name__)
 
-DISCORD_API_BASE = "https://discord.com/api/v10"
 PIN_REGEX = re.compile(r"\b(\d{4,6})\b")
 
 
@@ -44,50 +44,33 @@ class Discord2FAClient:
         self.poll_interval_seconds = poll_interval_seconds
         self._sleep = sleep_fn
         self._monotonic = monotonic_fn
-        self._owns_client = http_client is None
-        self._client = http_client or httpx.Client(
-            timeout=15.0,
-            headers={
-                "Authorization": f"Bot {bot_token}",
-                "Content-Type": "application/json",
-            },
+        self._discord = DiscordClient(
+            bot_token=bot_token,
+            channel_id=channel_id,
+            http_client=http_client,
         )
-        if http_client is not None:
-            self._client.headers.setdefault("Authorization", f"Bot {bot_token}")
 
     def close(self) -> None:
         """Close the owned HTTP client."""
-        if self._owns_client:
-            self._client.close()
+        self._discord.close()
 
     def send_message(self, content: str) -> str:
         """Post a message to the configured Discord channel and return its message ID."""
-        url = f"{DISCORD_API_BASE}/channels/{self.channel_id}/messages"
-        resp = self._client.post(url, json={"content": content})
-        if resp.status_code >= 400:
-            raise TRSessionError(f"Discord send_message failed ({resp.status_code}): {resp.text}")
-        data: dict[str, Any] = resp.json()
-        msg_id = str(data.get("id") or "")
-        if not msg_id:
-            raise TRSessionError("Discord response missing message id")
-        return msg_id
+        try:
+            return self._discord.send_message(content)
+        except DiscordAPIError as exc:
+            raise TRSessionError(str(exc)) from exc
 
     def wait_for_pin(self, after_message_id: str) -> str:
         """Poll Discord channel messages after `after_message_id` for a 4-digit PIN reply."""
-        url = f"{DISCORD_API_BASE}/channels/{self.channel_id}/messages"
         deadline = self._monotonic() + self.timeout_seconds
 
         while self._monotonic() < deadline:
             self._sleep(self.poll_interval_seconds)
-            resp = self._client.get(
-                url,
-                params={"after": after_message_id, "limit": 10},
-            )
-            if resp.status_code >= 400:
-                raise TRSessionError(
-                    f"Discord get_messages failed ({resp.status_code}): {resp.text}"
-                )
-            messages: list[dict[str, Any]] = resp.json()
+            try:
+                messages = self._discord.get_messages(after=after_message_id, limit=10)
+            except DiscordAPIError as exc:
+                raise TRSessionError(str(exc)) from exc
             for msg in reversed(messages):
                 author: dict[str, Any] = msg.get("author") or {}
                 if author.get("bot"):

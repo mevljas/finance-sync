@@ -267,3 +267,33 @@ def test_ibkr_worker_run_forever_and_cli_start_time(
     assert ibkr_main(["--start-time", "09:45"]) == 0
     assert captured["start_time"] == time(9, 45)
     assert captured["timezone_name"] == "UTC"
+
+
+@respx.mock
+def test_ibkr_main_notifies_discord_on_sync_error_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Verify ibkr_worker main() sends a Discord alert on --once failure when configured."""
+    channel_id = "000000000000000001"
+    discord_route = respx.post(f"https://discord.com/api/v10/channels/{channel_id}/messages").mock(
+        return_value=httpx.Response(200, json={"id": "err-msg-1"})
+    )
+
+    monkeypatch.setenv("USE_MOCK_DATA", "false")
+    monkeypatch.setenv("DRY_RUN", "false")
+    monkeypatch.setenv("SQLITE_DB_PATH", str(tmp_path / "err_ibkr.db"))
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "real-bot-token")
+    monkeypatch.setenv("DISCORD_CHANNEL_ID", channel_id)
+    monkeypatch.setattr(
+        "ibkr_worker.worker.IBKRWorker.sync_once",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("IBKR Flex 503")),
+    )
+
+    with pytest.raises(RuntimeError, match="IBKR Flex 503"):
+        ibkr_main(["--once"])
+
+    assert discord_route.call_count == 1
+    body = json.loads(discord_route.calls[0].request.content)
+    assert "IBKR" in body["content"]
+    assert "IBKR Flex 503" in body["content"]

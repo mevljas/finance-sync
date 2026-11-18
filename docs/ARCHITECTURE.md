@@ -47,6 +47,9 @@ flowchart LR
 - Implements `parse_start_time`, `resolve_timezone`, `compute_next_scheduled_run`, and `run_periodic_sync` shared by `ibkr_worker` and `tr_worker` (see ADR-0009).
 - Runs immediately on startup when `SYNC_START_TIME` is unset or when today's start time has already passed (anchoring subsequent runs to tomorrow's `SYNC_START_TIME + k * interval`), or waits until today's `SYNC_START_TIME` when started earlier.
 
+### `shared/discord.py`
+- Shared Discord REST API v10 client and optional `DiscordErrorHandler` (`ERROR`-level `logging.Handler`) attached by both `ibkr_worker` and `tr_worker` when `DISCORD_BOT_TOKEN` and `DISCORD_CHANNEL_ID` are configured (`has_discord == True`), with secret masking, 2000-character truncation, and dry-run/mock suppression (see ADR-0010).
+
 ### `shared/database.py`
 - Encapsulates SQLite connection management with `PRAGMA journal_mode=WAL;` and `PRAGMA busy_timeout=5000;` so `ibkr_worker` and `tr_worker` can safely read/write the shared `/app/data/finance_sync.db` concurrently.
 - Provides `compute_record_hash(broker, external_id, timestamp, amount)` using `hashlib.sha256`.
