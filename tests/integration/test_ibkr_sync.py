@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json
+from datetime import time
+from pathlib import Path
 
 import httpx
+import pytest
 import respx
 from config.settings import Settings
 from ibkr_worker.worker import IBKRWorker
+from ibkr_worker.worker import main as ibkr_main
 from shared.budgetbakers import BudgetBakersClient
 from shared.database import DeduplicationStore
 
@@ -224,3 +228,42 @@ def test_ibkr_worker_purge_existing_records_in_dry_run_and_live(
         live_summary = live_worker.sync_once(purge_existing_records=True)
         assert live_summary.deleted_existing_records == 2
         assert delete_route.call_count == 1
+
+
+def test_ibkr_worker_run_forever_and_cli_start_time(
+    test_settings: Settings,
+    dedup_store: DeduplicationStore,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Verify IBKRWorker.run_forever and CLI --start-time pass start_time to scheduler."""
+    captured: dict[str, object] = {}
+
+    def fake_run_periodic_sync(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("ibkr_worker.worker.run_periodic_sync", fake_run_periodic_sync)
+
+    scheduled_settings = test_settings.model_copy(
+        update={
+            "use_mock_data": True,
+            "sync_start_time": time(8, 15),
+            "sync_timezone": "UTC",
+        }
+    )
+    with BudgetBakersClient(token="test-token", use_mock_data=True) as bb_client:
+        worker = IBKRWorker(settings=scheduled_settings, db=dedup_store, bb_client=bb_client)
+        worker.run_forever()
+
+    assert captured["worker_name"] == "IBKR"
+    assert captured["interval_seconds"] == scheduled_settings.ibkr_poll_interval_seconds
+    assert captured["start_time"] == time(8, 15)
+    assert captured["timezone_name"] == "UTC"
+
+    captured.clear()
+    monkeypatch.setenv("USE_MOCK_DATA", "true")
+    monkeypatch.setenv("SQLITE_DB_PATH", str(tmp_path / "cli_ibkr.db"))
+    monkeypatch.setenv("SYNC_TIMEZONE", "UTC")
+    assert ibkr_main(["--start-time", "09:45"]) == 0
+    assert captured["start_time"] == time(9, 45)
+    assert captured["timezone_name"] == "UTC"

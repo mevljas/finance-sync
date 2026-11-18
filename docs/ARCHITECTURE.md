@@ -41,7 +41,11 @@ flowchart LR
 ### `config/settings.py`
 - Centralizes all environment configuration using `pydantic_settings.BaseSettings`.
 - Holds the deterministic merchant-to-category mapping rules for Trade Republic card transactions.
-- Exposes `use_mock_data` and `dry_run` flags.
+- Exposes `use_mock_data`, `dry_run`, `sync_start_time` (`SYNC_START_TIME`), and `sync_timezone` (`SYNC_TIMEZONE`) settings.
+
+### `shared/scheduler.py`
+- Implements `parse_start_time`, `resolve_timezone`, `compute_next_scheduled_run`, and `run_periodic_sync` shared by `ibkr_worker` and `tr_worker` (see ADR-0009).
+- Runs immediately on startup when `SYNC_START_TIME` is unset or when today's start time has already passed (anchoring subsequent runs to tomorrow's `SYNC_START_TIME + k * interval`), or waits until today's `SYNC_START_TIME` when started earlier.
 
 ### `shared/database.py`
 - Encapsulates SQLite connection management with `PRAGMA journal_mode=WAL;` and `PRAGMA busy_timeout=5000;` so `ibkr_worker` and `tr_worker` can safely read/write the shared `/app/data/finance_sync.db` concurrently.

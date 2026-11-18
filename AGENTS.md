@@ -20,6 +20,7 @@ Before modifying code, consult these source-of-truth documents in `docs/`:
   - [`0006-ibkr-multi-currency-fx-filtering-and-purge.md`](./docs/adr/0006-ibkr-multi-currency-fx-filtering-and-purge.md)
   - [`0007-couchdb-stock-holdings-and-paired-transfers.md`](./docs/adr/0007-couchdb-stock-holdings-and-paired-transfers.md)
   - [`0008-ibkr-historical-xml-import.md`](./docs/adr/0008-ibkr-historical-xml-import.md)
+  - [`0009-scheduled-sync-start-time.md`](./docs/adr/0009-scheduled-sync-start-time.md)
 
 ---
 

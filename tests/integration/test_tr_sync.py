@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import json
+from datetime import time
 from pathlib import Path
 
 import httpx
+import pytest
 import respx
 from config.settings import Settings
 from shared.budgetbakers import BudgetBakersClient
 from shared.database import DeduplicationStore
 from tr_worker.worker import TRWorker
+from tr_worker.worker import main as tr_main
 
 
 @respx.mock
@@ -201,3 +204,43 @@ def test_tr_worker_dry_run_previews_backfill_without_mutating_sqlite(
         assert patch_route.call_count == 1
         assert dedup_store.count() == 9
         assert dedup_store.get_metadata("tr_backfill_reconciled_v1") == "true"
+
+
+def test_tr_worker_run_forever_and_cli_start_time(
+    test_settings: Settings,
+    dedup_store: DeduplicationStore,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Verify TRWorker.run_forever and CLI --start-time pass start_time to scheduler."""
+    captured: dict[str, object] = {}
+
+    def fake_run_periodic_sync(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("tr_worker.worker.run_periodic_sync", fake_run_periodic_sync)
+
+    scheduled_settings = test_settings.model_copy(
+        update={
+            "use_mock_data": True,
+            "sync_start_time": time(7, 30),
+            "sync_timezone": "UTC",
+        }
+    )
+    with BudgetBakersClient(token="test-token", use_mock_data=True) as bb_client:
+        worker = TRWorker(settings=scheduled_settings, db=dedup_store, bb_client=bb_client)
+        worker.run_forever()
+
+    assert captured["worker_name"] == "Trade Republic"
+    assert captured["interval_seconds"] == scheduled_settings.tr_poll_interval_seconds
+    assert captured["start_time"] == time(7, 30)
+    assert captured["timezone_name"] == "UTC"
+
+    captured.clear()
+    monkeypatch.setenv("USE_MOCK_DATA", "true")
+    monkeypatch.setenv("SQLITE_DB_PATH", str(tmp_path / "cli_tr.db"))
+    monkeypatch.setenv("TR_SESSION_DIR", str(tmp_path / "tr_session"))
+    monkeypatch.setenv("SYNC_TIMEZONE", "UTC")
+    assert tr_main(["--start-time", "10:20:30"]) == 0
+    assert captured["start_time"] == time(10, 20, 30)
+    assert captured["timezone_name"] == "UTC"

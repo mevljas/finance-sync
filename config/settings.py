@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time
 from functools import lru_cache
 from pathlib import Path
+from zoneinfo import ZoneInfoNotFoundError
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from shared.scheduler import parse_start_time, resolve_timezone
 
 # Deterministic BudgetBakers Wallet system category UUIDs
 CATEGORY_INVESTMENTS = "5c5c232a-005a-8000-8000-000000000000"
@@ -106,6 +108,33 @@ class Settings(BaseSettings):
         default=Path("/app/data/finance_sync.db"),
         alias="SQLITE_DB_PATH",
     )
+    sync_start_time: time | None = Field(
+        default=None,
+        alias="SYNC_START_TIME",
+    )
+    sync_timezone: str | None = Field(
+        default=None,
+        alias="SYNC_TIMEZONE",
+    )
+
+    @field_validator("sync_start_time", mode="before")
+    @classmethod
+    def _validate_sync_start_time(cls, value: str | time | None) -> time | None:
+        return parse_start_time(value)
+
+    @field_validator("sync_timezone", mode="before")
+    @classmethod
+    def _validate_sync_timezone(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            resolve_timezone(stripped)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(f"Invalid SYNC_TIMEZONE {value!r}: {exc}") from exc
+        return stripped
 
     # BudgetBakers Wallet API
     budgetbakers_base_url: str = Field(

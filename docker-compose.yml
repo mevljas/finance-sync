@@ -19,6 +19,9 @@ services:
       DRY_RUN: ${DRY_RUN:-false}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       SQLITE_DB_PATH: /app/data/finance_sync.db
+      SYNC_START_TIME: ${SYNC_START_TIME:-}
+      SYNC_TIMEZONE: ${SYNC_TIMEZONE:-}
+      TZ: ${TZ:-Europe/Ljubljana}
       BUDGETBAKERS_BASE_URL: ${BUDGETBAKERS_BASE_URL:-https://rest.budgetbakers.com/wallet}
       BUDGETBAKERS_TOKEN: ${BUDGETBAKERS_TOKEN:?BUDGETBAKERS_TOKEN is required}
       BB_IBKR_ACCOUNT_ID: ${BB_IBKR_ACCOUNT_ID:?BB_IBKR_ACCOUNT_ID is required}
@@ -54,6 +57,9 @@ services:
       DRY_RUN: ${DRY_RUN:-false}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       SQLITE_DB_PATH: /app/data/finance_sync.db
+      SYNC_START_TIME: ${SYNC_START_TIME:-}
+      SYNC_TIMEZONE: ${SYNC_TIMEZONE:-}
+      TZ: ${TZ:-Europe/Ljubljana}
       BUDGETBAKERS_BASE_URL: ${BUDGETBAKERS_BASE_URL:-https://rest.budgetbakers.com/wallet}
       BUDGETBAKERS_TOKEN: ${BUDGETBAKERS_TOKEN:?BUDGETBAKERS_TOKEN is required}
       BB_TR_CASH_ACCOUNT_ID: ${BB_TR_CASH_ACCOUNT_ID:?BB_TR_CASH_ACCOUNT_ID is required}

@@ -143,6 +143,7 @@ uv run pytest --cov=config --cov=shared --cov=ibkr_worker --cov=tr_worker --cov-
      - `TR_PIN=...`
      - `DISCORD_BOT_TOKEN=...`
      - `DISCORD_CHANNEL_ID=...`
+     - Optional scheduling: `SYNC_START_TIME=08:00` (if unset, runs immediately on startup; if already past today's time, runs immediately and schedules tomorrow at `SYNC_START_TIME`, then repeats every `IBKR_POLL_INTERVAL_SECONDS` / `TR_POLL_INTERVAL_SECONDS`) and `SYNC_TIMEZONE` / `TZ` (defaults to `Europe/Ljubljana` in Docker).
    - Click **Deploy the stack**.
 3. On first startup, `tr_worker` will post a 2FA prompt in your Discord channel. Reply with the 4-digit code from your Trade Republic app to persist the session in the `finance_sync_data` volume.
 

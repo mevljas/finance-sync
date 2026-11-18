@@ -40,13 +40,15 @@ LABEL org.opencontainers.image.title="finance-sync" \
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH="/app" \
-    PATH="/app/.venv/bin:$PATH"
+    PATH="/app/.venv/bin:$PATH" \
+    TZ="Europe/Ljubljana"
 
 WORKDIR /app
 
-# Remove pip/setuptools/wheel/ensurepip from base Python to shrink image & attack surface,
-# and create unprivileged user (UID 10001) + persistent data directory
-RUN rm -rf /usr/local/lib/python3.12/ensurepip \
+# Install tzdata for IANA timezone support (SYNC_TIMEZONE / TZ), remove pip/setuptools/wheel/ensurepip
+# from base Python to shrink image & attack surface, and create unprivileged user (UID 10001)
+RUN apk add --no-cache tzdata && \
+    rm -rf /usr/local/lib/python3.12/ensurepip \
            /usr/local/lib/python3.12/site-packages/pip* \
            /usr/local/lib/python3.12/site-packages/setuptools* \
            /usr/local/lib/python3.12/site-packages/wheel* && \

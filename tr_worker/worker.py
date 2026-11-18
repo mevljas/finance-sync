@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -19,6 +18,7 @@ from shared.budgetbakers import (
 )
 from shared.couchdb import CouchDBStockSyncClient, load_delete_file
 from shared.database import DeduplicationStore, SeenRecordEntry, compute_record_hash
+from shared.scheduler import parse_start_time, run_periodic_sync
 
 from tr_worker.event_parser import (
     ParsedTRRecord,
@@ -301,16 +301,13 @@ class TRWorker:
 
     def run_forever(self) -> None:
         """Continuously poll Trade Republic at configured interval."""
-        logger.info(
-            "Starting Trade Republic worker loop (interval=%ds)",
-            self.settings.tr_poll_interval_seconds,
+        run_periodic_sync(
+            worker_name="Trade Republic",
+            interval_seconds=self.settings.tr_poll_interval_seconds,
+            sync_fn=self.sync_once,
+            start_time=self.settings.sync_start_time,
+            timezone_name=self.settings.sync_timezone,
         )
-        while True:
-            try:
-                self.sync_once()
-            except Exception:
-                logger.exception("Error during Trade Republic sync iteration")
-            time.sleep(self.settings.tr_poll_interval_seconds)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -339,11 +336,22 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Path to JSON file listing specific record_ids and couchdb_doc_ids to delete",
     )
+    parser.add_argument(
+        "--start-time",
+        type=str,
+        default=None,
+        help="Optional daily start time (HH:MM or HH:MM:SS) overriding SYNC_START_TIME",
+    )
     args = parser.parse_args(argv)
 
     settings = get_settings()
+    updates: dict[str, Any] = {}
     if args.dry_run or args.dry_run_output is not None:
-        settings = settings.model_copy(update={"dry_run": True})
+        updates["dry_run"] = True
+    if args.start_time is not None:
+        updates["sync_start_time"] = parse_start_time(args.start_time)
+    if updates:
+        settings = settings.model_copy(update=updates)
 
     logging.basicConfig(
         level=getattr(logging, settings.log_level.upper(), logging.INFO),
