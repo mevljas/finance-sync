@@ -29,7 +29,7 @@ flowchart LR
 
     IBKR -->|"SendRequest -> 10s -> GetStatement"| IW
     TR <-->|"Timeline & Portfolio"| TW
-    TW <-->|"Prompt & Read 4-digit PIN"| DISC
+    TW <-->|"Ready-First 2FA\n(Gateway MESSAGE_CREATE)"| DISC
     TW <--> SESS
     IW <--> DB
     TW <--> DB
@@ -45,7 +45,7 @@ flowchart LR
    - Logs dividends and broker interest (`CashTransactions`), while skipping SEPA deposits/withdrawals (already paired via Revolut bank-sync in Wallet).
    - Patches the investment account's live market value (`OpenPositions` + ending cash) via `PATCH /v1/api/accounts`.
 2. **Trade Republic (`tr_worker`)**:
-   - Maintains a persistent `pytr` session in `/app/data`. When 2FA expires, sends an interactive verification prompt to your **Discord channel** via a Discord Bot, reads your 4-digit reply, completes login, and saves refreshed cookies automatically.
+   - Maintains a persistent `pytr` session in `/app/data`. When 2FA expires, subscribes to Discord Gateway `MESSAGE_CREATE` events, posts a ready-first prompt in your **Discord channel** (no timeout), starts login only once you reply with your 6-digit Authenticator code, keeps waiting for a new code if login fails, and saves refreshed cookies automatically.
    - Splits events across your **Trade Republic Cash** (`BB_TR_CASH_ACCOUNT_ID`) and **Trade Republic Wealth** (`BB_TR_WEALTH_ACCOUNT_ID`) accounts:
      - **Card payments** (newer than `TR_CARD_CUTOFF_DATE`): Logged as expenses on Cash with automatic merchant keyword + MCC categorization (e.g., Supermarket/Grocery -> `Groceries`, Burger Diner/Restaurant -> `Restaurants & fast food`, Coffee Shop/Cafe -> `Bar cafe`, Steam -> `Software, apps, games`).
      - **Monthly interest**: Logged as income (`Interest, dividends`) on Cash.

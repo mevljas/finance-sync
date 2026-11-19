@@ -77,8 +77,6 @@ class TRWorker:
             discord_client = Discord2FAClient(
                 bot_token=settings.discord_bot_token.get_secret_value(),
                 channel_id=settings.discord_channel_id,
-                timeout_seconds=settings.discord_2fa_timeout_seconds,
-                poll_interval_seconds=settings.discord_2fa_poll_interval_seconds,
             )
             self.session_manager = TRSessionManager(
                 phone_no=settings.tr_phone_no,

@@ -12,6 +12,7 @@ from pydantic import SecretStr
 from shared.discord import (
     DISCORD_API_BASE,
     DISCORD_MAX_MESSAGE_LENGTH,
+    DiscordAPIError,
     DiscordClient,
     DiscordErrorHandler,
     DiscordErrorNotifier,
@@ -177,3 +178,24 @@ def test_attach_discord_error_handler_respects_optional_config(
         logging.getLogger("tests.root_attach").error("Root error test")
 
     assert route.call_count == 1
+
+
+@respx.mock
+def test_discord_client_get_gateway_url() -> None:
+    """Verify DiscordClient.get_gateway_url parses /gateway/bot and raises on errors."""
+    respx.get(f"{DISCORD_API_BASE}/gateway/bot").mock(
+        side_effect=[
+            httpx.Response(200, json={"url": "wss://gateway.discord.gg/"}),
+            httpx.Response(200, json={}),
+            httpx.Response(401, text="Unauthorized"),
+        ]
+    )
+    client = DiscordClient(bot_token="real-bot-token", channel_id="000000000000000001")
+    try:
+        assert client.get_gateway_url() == "wss://gateway.discord.gg"
+        with pytest.raises(DiscordAPIError, match="missing url"):
+            client.get_gateway_url()
+        with pytest.raises(DiscordAPIError, match="401"):
+            client.get_gateway_url()
+    finally:
+        client.close()

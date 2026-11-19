@@ -5,7 +5,7 @@ Managing personal finances across multiple European brokers and fintech platform
 
 ## 2. Goals & Objectives
 1. **IBKR Ingestion**: Fetch and parse Activity Flex Query XML statements (`Trades`, `CashTransactions`, `OpenPositions`, `CashReport`) via IBKR Flex Web Service two-step polling (`SendRequest` -> wait 10s -> `GetStatement`) using `ibflex2`.
-2. **Trade Republic Ingestion**: Fetch and parse timeline events (card debits, monthly interest, 1% Saveback bonus income, savings plans, stock buys, dividends, SEPA cash transfers) and live portfolio valuation via `pytr`, with an interactive **Discord Bot** fallback for 2FA session renewal.
+2. **Trade Republic Ingestion**: Fetch and parse timeline events (card debits, monthly interest, 1% Saveback bonus income, savings plans, stock buys, dividends, SEPA cash transfers) and live portfolio valuation via `pytr`, with an interactive, ready-first, zero-timeout **Discord Gateway Bot** fallback for 2FA session renewal.
 3. **Deduplication & Reconciliation**: Deduplicate all ingested transactions in a shared local SQLite WAL database (`seen_records`) using `sha256(broker + external_id + timestamp + normalized_amount)` and reconcile against BudgetBakers Wallet REST API (`POST /v1/api/records` in batches of `<=20`, `PATCH /v1/api/accounts` for live portfolio valuation).
 4. **Homelab Containerization**: Package into an ultra-minimal Alpine Linux Docker image (`python:3.12-alpine` + `uv`) deployed via a Portainer-compatible `docker-compose.yml` stack.
 

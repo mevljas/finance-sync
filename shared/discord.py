@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
 DISCORD_MAX_MESSAGE_LENGTH = 2000
+# GUILD_MESSAGES (1 << 9) | DIRECT_MESSAGES (1 << 12) | MESSAGE_CONTENT (1 << 15)
+DISCORD_GATEWAY_INTENTS = (1 << 9) | (1 << 12) | (1 << 15)
 
 
 class DiscordAPIError(RuntimeError):
@@ -70,6 +72,20 @@ class DiscordClient:
             raise DiscordAPIError(f"Discord get_messages failed ({resp.status_code}): {resp.text}")
         messages: list[dict[str, Any]] = resp.json()
         return messages
+
+    def get_gateway_url(self) -> str:
+        """Fetch the Discord Gateway WebSocket base URL via GET /gateway/bot."""
+        url = f"{DISCORD_API_BASE}/gateway/bot"
+        resp = self._client.get(url)
+        if resp.status_code >= 400:
+            raise DiscordAPIError(
+                f"Discord get_gateway_url failed ({resp.status_code}): {resp.text}"
+            )
+        data: dict[str, Any] = resp.json()
+        gateway_url = str(data.get("url") or "").strip().rstrip("/")
+        if not gateway_url:
+            raise DiscordAPIError("Discord gateway response missing url")
+        return gateway_url
 
 
 class DiscordErrorNotifier:

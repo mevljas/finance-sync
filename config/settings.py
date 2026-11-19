@@ -244,14 +244,6 @@ class Settings(BaseSettings):
         default="000000000000000000",
         alias="DISCORD_CHANNEL_ID",
     )
-    discord_2fa_timeout_seconds: float = Field(
-        default=300.0,
-        alias="DISCORD_2FA_TIMEOUT_SECONDS",
-    )
-    discord_2fa_poll_interval_seconds: float = Field(
-        default=3.0,
-        alias="DISCORD_2FA_POLL_INTERVAL_SECONDS",
-    )
 
     @property
     def has_discord(self) -> bool:

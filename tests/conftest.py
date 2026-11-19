@@ -37,8 +37,6 @@ def test_settings(tmp_path: Path) -> Settings:
         TR_SESSION_DIR=tmp_path / "tr_session",
         DISCORD_BOT_TOKEN=SecretStr("test-discord-bot-token"),
         DISCORD_CHANNEL_ID="000000000000000001",
-        DISCORD_2FA_TIMEOUT_SECONDS=5.0,
-        DISCORD_2FA_POLL_INTERVAL_SECONDS=0.0,
     )
 
 

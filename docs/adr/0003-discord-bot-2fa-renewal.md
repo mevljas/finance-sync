@@ -1,7 +1,7 @@
 # ADR 0003: Interactive Discord Bot for Trade Republic 2FA Renewal
 
 ## Status
-Accepted
+Accepted *(Polling and timeout mechanics superseded by [ADR-0011](./0011-discord-gateway-ready-first-2fa.md))*
 
 ## Context
 Trade Republic's private API (`pytr`) requires a 4-digit 2FA verification code sent to the user's Trade Republic mobile app or SMS whenever the persistent web session expires. Because `tr_worker` runs headlessly inside a Portainer container, interactive terminal input (`input()`) is inconvenient.

@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-import pytest
 import respx
 from config.settings import CATEGORY_GROCERIES, CATEGORY_RESTAURANTS, Settings
 from shared.mock_data import load_mock_tr_portfolio, load_mock_tr_timeline
@@ -16,7 +15,7 @@ from tr_worker.event_parser import (
     parse_tr_portfolio_value,
     parse_tr_timeline_events,
 )
-from tr_worker.session_manager import Discord2FAClient, TRSessionError, TRSessionManager
+from tr_worker.session_manager import Discord2FAClient, TRSessionManager
 
 
 def test_parse_tr_timeline_events_classifies_all_event_types(
@@ -95,22 +94,59 @@ def test_parse_tr_portfolio_value() -> None:
 
 @respx.mock
 def test_discord_2fa_flow_and_tr_session_manager(tmp_path: Path) -> None:
-    """Verify Discord bot posts 2FA prompt, reads 4-digit PIN reply, and persists session."""
+    """Verify Discord Gateway 2FA flow reads 4-digit reply after READY and persists session."""
+    import asyncio
+    import json
+    from collections.abc import AsyncIterator
+    from contextlib import asynccontextmanager
+
     channel_id = "000000000000000001"
-    respx.post(f"https://discord.com/api/v10/channels/{channel_id}/messages").mock(
-        side_effect=[
-            httpx.Response(200, json={"id": "msg-prompt-1"}),
-            httpx.Response(200, json={"id": "msg-confirm-2"}),
-        ]
+    respx.get("https://discord.com/api/v10/gateway/bot").mock(
+        return_value=httpx.Response(200, json={"url": "wss://gateway.discord.gg"})
     )
-    respx.get(f"https://discord.com/api/v10/channels/{channel_id}/messages").mock(
-        return_value=httpx.Response(
-            200,
-            json=[
-                {"id": "msg-bot", "content": "Bot msg", "author": {"bot": True}},
-                {"id": "msg-user", "content": "Code is 1111", "author": {"bot": False}},
-            ],
-        )
+
+    incoming: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    loop_ref: list[asyncio.AbstractEventLoop] = []
+    incoming.put_nowait({"op": 10, "d": {"heartbeat_interval": 41250}})
+    incoming.put_nowait({"op": 0, "t": "READY", "s": 1, "d": {"session_id": "sess-0001"}})
+
+    class _MockWS:
+        async def recv(self) -> str:
+            if not loop_ref:
+                loop_ref.append(asyncio.get_running_loop())
+            return json.dumps(await incoming.get())
+
+        async def send(self, _data: str) -> None:
+            pass
+
+    @asynccontextmanager
+    async def _connect(_url: str) -> AsyncIterator[_MockWS]:
+        yield _MockWS()
+
+    msg_seq = 0
+
+    def _post_msg(_req: httpx.Request) -> httpx.Response:
+        nonlocal msg_seq
+        msg_seq += 1
+        if msg_seq == 1 and loop_ref:
+            loop_ref[0].call_soon_threadsafe(
+                incoming.put_nowait,
+                {
+                    "op": 0,
+                    "t": "MESSAGE_CREATE",
+                    "s": 2,
+                    "d": {
+                        "id": "000000000000000101",
+                        "channel_id": channel_id,
+                        "content": "Code is 1111",
+                        "author": {"bot": False},
+                    },
+                },
+            )
+        return httpx.Response(200, json={"id": f"00000000000000010{msg_seq - 1}"})
+
+    respx.post(f"https://discord.com/api/v10/channels/{channel_id}/messages").mock(
+        side_effect=_post_msg
     )
 
     submitted_pins: list[str] = []
@@ -131,9 +167,7 @@ def test_discord_2fa_flow_and_tr_session_manager(tmp_path: Path) -> None:
     discord_client = Discord2FAClient(
         bot_token="bot-token",
         channel_id=channel_id,
-        timeout_seconds=5.0,
-        poll_interval_seconds=0.0,
-        sleep_fn=lambda _: None,
+        ws_connect=_connect,
     )
     manager = TRSessionManager(
         phone_no="+49000000000",
@@ -147,31 +181,6 @@ def test_discord_2fa_flow_and_tr_session_manager(tmp_path: Path) -> None:
     manager.ensure_authenticated()
     assert submitted_pins == ["1111"]
     assert manager.has_valid_session()
-    discord_client.close()
-
-
-@respx.mock
-def test_discord_2fa_timeout_raises_session_error() -> None:
-    """Verify TRSessionError is raised if user does not reply in Discord before timeout."""
-    channel_id = "000000000000000001"
-    respx.post(f"https://discord.com/api/v10/channels/{channel_id}/messages").mock(
-        return_value=httpx.Response(200, json={"id": "msg-prompt-1"})
-    )
-    respx.get(f"https://discord.com/api/v10/channels/{channel_id}/messages").mock(
-        return_value=httpx.Response(200, json=[])
-    )
-
-    clock = iter([0.0, 1.0, 10.0])
-    discord_client = Discord2FAClient(
-        bot_token="bot-token",
-        channel_id=channel_id,
-        timeout_seconds=5.0,
-        poll_interval_seconds=0.0,
-        sleep_fn=lambda _: None,
-        monotonic_fn=lambda: next(clock),
-    )
-    with pytest.raises(TRSessionError, match="Timed out"):
-        discord_client.prompt_and_wait_for_pin()
     discord_client.close()
 
 
@@ -273,22 +282,58 @@ def test_parse_tr_timeline_detail_v2_nested_sections_and_saveback(
 @respx.mock
 def test_discord_2fa_6_digit_authenticator_and_mobile_confirm(tmp_path: Path) -> None:
     """Verify 6-digit Authenticator code followed by mobile app confirmation."""
+    import asyncio
+    import json
+    from collections.abc import AsyncIterator
+    from contextlib import asynccontextmanager
+
     channel_id = "000000000000000001"
-    respx.post(f"https://discord.com/api/v10/channels/{channel_id}/messages").mock(
-        side_effect=[
-            httpx.Response(200, json={"id": "msg-prompt-1"}),
-            httpx.Response(200, json={"id": "msg-confirm-2"}),
-            httpx.Response(200, json={"id": "msg-step2-3"}),
-            httpx.Response(200, json={"id": "msg-done-4"}),
-        ]
+    respx.get("https://discord.com/api/v10/gateway/bot").mock(
+        return_value=httpx.Response(200, json={"url": "wss://gateway.discord.gg"})
     )
-    respx.get(f"https://discord.com/api/v10/channels/{channel_id}/messages").mock(
-        return_value=httpx.Response(
-            200,
-            json=[
-                {"id": "msg-user", "content": "000000", "author": {"bot": False}},
-            ],
-        )
+
+    incoming: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    loop_ref: list[asyncio.AbstractEventLoop] = []
+    incoming.put_nowait({"op": 10, "d": {"heartbeat_interval": 41250}})
+    incoming.put_nowait({"op": 0, "t": "READY", "s": 1, "d": {"session_id": "sess-0001"}})
+
+    class _MockWS:
+        async def recv(self) -> str:
+            if not loop_ref:
+                loop_ref.append(asyncio.get_running_loop())
+            return json.dumps(await incoming.get())
+
+        async def send(self, _data: str) -> None:
+            pass
+
+    @asynccontextmanager
+    async def _connect(_url: str) -> AsyncIterator[_MockWS]:
+        yield _MockWS()
+
+    msg_seq = 0
+
+    def _post_msg(_req: httpx.Request) -> httpx.Response:
+        nonlocal msg_seq
+        msg_seq += 1
+        if msg_seq == 1 and loop_ref:
+            loop_ref[0].call_soon_threadsafe(
+                incoming.put_nowait,
+                {
+                    "op": 0,
+                    "t": "MESSAGE_CREATE",
+                    "s": 2,
+                    "d": {
+                        "id": "000000000000000101",
+                        "channel_id": channel_id,
+                        "content": "000000",
+                        "author": {"bot": False},
+                    },
+                },
+            )
+        return httpx.Response(200, json={"id": f"00000000000000010{msg_seq - 1}"})
+
+    respx.post(f"https://discord.com/api/v10/channels/{channel_id}/messages").mock(
+        side_effect=_post_msg
     )
 
     events_called: list[str] = []
@@ -322,9 +367,7 @@ def test_discord_2fa_6_digit_authenticator_and_mobile_confirm(tmp_path: Path) ->
     discord_client = Discord2FAClient(
         bot_token="bot-token",
         channel_id=channel_id,
-        timeout_seconds=5.0,
-        poll_interval_seconds=0.0,
-        sleep_fn=lambda _: None,
+        ws_connect=_connect,
     )
     manager = TRSessionManager(
         phone_no="+49000000000",

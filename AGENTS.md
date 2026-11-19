@@ -22,6 +22,7 @@ Before modifying code, consult these source-of-truth documents in `docs/`:
   - [`0008-ibkr-historical-xml-import.md`](./docs/adr/0008-ibkr-historical-xml-import.md)
   - [`0009-scheduled-sync-start-time.md`](./docs/adr/0009-scheduled-sync-start-time.md)
   - [`0010-discord-error-notifications.md`](./docs/adr/0010-discord-error-notifications.md)
+  - [`0011-discord-gateway-ready-first-2fa.md`](./docs/adr/0011-discord-gateway-ready-first-2fa.md)
 
 ---
 

@@ -26,7 +26,7 @@ flowchart LR
 
     IBKR -->|"1. SendRequest\n2. Wait 10s\n3. GetStatement"| IW
     TR <-->|"Timeline & Portfolio"| TW
-    TW <-->|"2FA Prompt & 4-digit PIN"| DISCORD
+    TW <-->|"Ready-First 2FA\n(Gateway MESSAGE_CREATE)"| DISCORD
     TW <--> TRSESS
     IW <--> SQLITE
     TW <--> SQLITE
@@ -48,7 +48,7 @@ flowchart LR
 - Runs immediately on startup when `SYNC_START_TIME` is unset or when today's start time has already passed (anchoring subsequent runs to tomorrow's `SYNC_START_TIME + k * interval`), or waits until today's `SYNC_START_TIME` when started earlier.
 
 ### `shared/discord.py`
-- Shared Discord REST API v10 client and optional `DiscordErrorHandler` (`ERROR`-level `logging.Handler`) attached by both `ibkr_worker` and `tr_worker` when `DISCORD_BOT_TOKEN` and `DISCORD_CHANNEL_ID` are configured (`has_discord == True`), with secret masking, 2000-character truncation, and dry-run/mock suppression (see ADR-0010).
+- Shared Discord REST API v10 client (including `get_gateway_url()` for Gateway WebSocket discovery) and optional `DiscordErrorHandler` (`ERROR`-level `logging.Handler`) attached by both `ibkr_worker` and `tr_worker` when `DISCORD_BOT_TOKEN` and `DISCORD_CHANNEL_ID` are configured (`has_discord == True`), with secret masking, 2000-character truncation, and dry-run/mock suppression (see ADR-0010).
 
 ### `shared/database.py`
 - Encapsulates SQLite connection management with `PRAGMA journal_mode=WAL;` and `PRAGMA busy_timeout=5000;` so `ibkr_worker` and `tr_worker` can safely read/write the shared `/app/data/finance_sync.db` concurrently.
@@ -68,6 +68,6 @@ flowchart LR
 - `worker.py`: Orchestrates polling (`IBKRWorker`), optional full account record purge (`--purge-account-records`) or targeted deletion from a local gitignored JSON file (`--delete-file`), local historical XML file/directory ingestion (`--xml-file`), CouchDB stock holdings sync (`CouchDBStockSyncClient`), automatic existing-record seeding on fresh SQLite volumes, record creation on `BB_IBKR_ACCOUNT_ID`, live uninvested cash balance patching, and CLI flags (`--once`, `--dry-run`, `--dry-run-output`, `--purge-account-records`, `--delete-file`, `--xml-file`).
 
 ### `tr_worker/`
-- `session_manager.py`: Wraps `pytr` session persistence in `/app/data` (`TRSessionManager`) and implements `Discord2FAClient` using Discord REST API v10 to request and read a 4-to-6-digit 2FA verification code when the session expires.
+- `session_manager.py`: Wraps `pytr` session persistence in `/app/data` (`TRSessionManager`) and implements `Discord2FAClient` using Discord Gateway v10 (`MESSAGE_CREATE` event subscription with zero timeout and ready-first login initiation) to receive a 4-to-6-digit verification code and retry indefinitely on login failure (see ADR-0011).
 - `event_parser.py`: Pure functional parser (`parse_tr_timeline_events`, `parse_tr_portfolio_value`, `parse_tr_stock_trades`, `parse_tr_live_positions`) converting raw Trade Republic timeline & portfolio JSON payloads into typed `ParsedTRRecord` (`TRRecordKind`) and `StockTradeInput` objects with target account routing (`cash` vs. `wealth`), paired `Transfer` creation, category resolution, and stock buy `note` formatting.
 - `worker.py`: Orchestrates initial existing-record seeding (`TRWorker`), optional full account purge (`--purge-account-records`) or targeted deletion from a local gitignored JSON file (`--delete-file`), syncs new timeline events and CouchDB stock holdings per batch (skipping SQLite/CouchDB mutations in dry-run mode), patches `BB_TR_WEALTH_ACCOUNT_ID` balance, and supports `--once`, `--dry-run`, `--dry-run-output`, `--purge-account-records`, and `--delete-file`.

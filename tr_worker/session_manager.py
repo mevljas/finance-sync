@@ -8,42 +8,103 @@ import json
 import logging
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
 import httpx
-from shared.discord import DiscordAPIError, DiscordClient
+import websockets.asyncio.client
+import websockets.exceptions
+from shared.discord import DISCORD_GATEWAY_INTENTS, DiscordAPIError, DiscordClient
 from shared.mock_data import load_mock_tr_portfolio, load_mock_tr_timeline
 
 logger = logging.getLogger(__name__)
 
 PIN_REGEX = re.compile(r"\b(\d{4,6})\b")
+FATAL_GATEWAY_CLOSE_CODES = frozenset({4004, 4010, 4011, 4012, 4013, 4014})
+DEFAULT_2FA_PROMPT = (
+    "🔐 **Trade Republic 2FA Required**\n"
+    "Your Trade Republic session has expired.\n"
+    "Whenever you are ready, reply in this channel with your "
+    "**6-digit code from your Authenticator app** (no timeout) to start login."
+)
 
 
 class TRSessionError(RuntimeError):
     """Raised when Trade Republic authentication or 2FA renewal fails."""
 
 
+class _GatewayReconnectSignal(Exception):
+    """Internal control-flow signal requesting a Gateway reconnect."""
+
+    def __init__(self, *, resumable: bool) -> None:
+        super().__init__("Discord Gateway reconnect requested")
+        self.resumable = resumable
+
+
+def _close_code_and_reason(exc: websockets.exceptions.ConnectionClosed) -> tuple[int | None, str]:
+    if exc.rcvd is not None:
+        return int(exc.rcvd.code), str(exc.rcvd.reason or "")
+    return None, ""
+
+
+def _is_message_after(message_id: str, after_message_id: str) -> bool:
+    if message_id.isdigit() and after_message_id.isdigit():
+        return int(message_id) > int(after_message_id)
+    return bool(message_id) and message_id != after_message_id
+
+
+def _extract_pin_from_message(
+    message: dict[str, Any],
+    *,
+    channel_id: str,
+    after_message_id: str,
+) -> str | None:
+    if str(message.get("channel_id") or "") != channel_id:
+        return None
+    msg_id = str(message.get("id") or "")
+    if not _is_message_after(msg_id, after_message_id):
+        return None
+    author: dict[str, Any] = message.get("author") or {}
+    if author.get("bot"):
+        return None
+    content = str(message.get("content") or "").strip()
+    match = PIN_REGEX.search(content)
+    return match.group(1) if match else None
+
+
+async def _heartbeat_loop(
+    ws: Any,
+    interval_seconds: float,
+    seq_ref: list[int | None],
+    ack_state: list[bool],
+) -> None:
+    while True:
+        await asyncio.sleep(interval_seconds)
+        if not ack_state[0]:
+            logger.warning("Discord Gateway missed heartbeat ACK; closing connection to resume")
+            await ws.close(code=4000, reason="Heartbeat ACK missed")
+            return
+        ack_state[0] = False
+        await ws.send(json.dumps({"op": 1, "d": seq_ref[0]}))
+
+
 class Discord2FAClient:
-    """Interacts with Discord REST API v10 to prompt for and retrieve a 4-digit 2FA PIN."""
+    """Interacts with Discord Gateway v10 & REST API v10 to prompt for and receive a 2FA code."""
 
     def __init__(
         self,
         bot_token: str,
         channel_id: str,
         *,
-        timeout_seconds: float = 300.0,
-        poll_interval_seconds: float = 3.0,
         http_client: httpx.Client | None = None,
-        sleep_fn: Callable[[float], None] = time.sleep,
-        monotonic_fn: Callable[[], float] = time.monotonic,
+        ws_connect: Callable[[str], Any] | None = None,
+        reconnect_sleep_fn: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
+        self._bot_token = bot_token
         self.channel_id = channel_id
-        self.timeout_seconds = timeout_seconds
-        self.poll_interval_seconds = poll_interval_seconds
-        self._sleep = sleep_fn
-        self._monotonic = monotonic_fn
+        self._ws_connect = ws_connect or websockets.asyncio.client.connect
+        self._reconnect_sleep = reconnect_sleep_fn
         self._discord = DiscordClient(
             bot_token=bot_token,
             channel_id=channel_id,
@@ -61,37 +122,159 @@ class Discord2FAClient:
         except DiscordAPIError as exc:
             raise TRSessionError(str(exc)) from exc
 
-    def wait_for_pin(self, after_message_id: str) -> str:
-        """Poll Discord channel messages after `after_message_id` for a 4-digit PIN reply."""
-        deadline = self._monotonic() + self.timeout_seconds
+    async def _send_identify_or_resume(
+        self,
+        ws: Any,
+        *,
+        session_id: str | None,
+        seq: int | None,
+    ) -> None:
+        if session_id is not None and seq is not None:
+            payload: dict[str, Any] = {
+                "op": 6,
+                "d": {
+                    "token": self._bot_token,
+                    "session_id": session_id,
+                    "seq": seq,
+                },
+            }
+        else:
+            payload = {
+                "op": 2,
+                "d": {
+                    "token": self._bot_token,
+                    "intents": DISCORD_GATEWAY_INTENTS,
+                    "properties": {
+                        "os": "linux",
+                        "browser": "finance-sync",
+                        "device": "finance-sync",
+                    },
+                },
+            }
+        await ws.send(json.dumps(payload))
 
-        while self._monotonic() < deadline:
-            self._sleep(self.poll_interval_seconds)
+    async def prompt_and_wait_for_pin_async(self, prompt_message: str | None = None) -> str:
+        """Connect to Discord Gateway, post prompt after READY, and wait indefinitely for a code."""
+        try:
+            initial_gateway_url = await asyncio.to_thread(self._discord.get_gateway_url)
+        except DiscordAPIError as exc:
+            raise TRSessionError(str(exc)) from exc
+
+        active_prompt = prompt_message or DEFAULT_2FA_PROMPT
+        prompt_id: str | None = None
+        session_id: str | None = None
+        resume_gateway_url: str | None = None
+        seq_ref: list[int | None] = [None]
+        backoff_attempt = 0
+
+        while True:
+            base_url = (
+                resume_gateway_url if session_id and resume_gateway_url else initial_gateway_url
+            )
+            ws_url = f"{base_url.rstrip('/')}/?v=10&encoding=json"
+            heartbeat_task: asyncio.Task[None] | None = None
+            ack_state = [True]
+
             try:
-                messages = self._discord.get_messages(after=after_message_id, limit=10)
-            except DiscordAPIError as exc:
-                raise TRSessionError(str(exc)) from exc
-            for msg in reversed(messages):
-                author: dict[str, Any] = msg.get("author") or {}
-                if author.get("bot"):
-                    continue
-                content = str(msg.get("content") or "").strip()
-                match = PIN_REGEX.search(content)
-                if match:
-                    return match.group(1)
+                async with self._ws_connect(ws_url) as ws:
+                    backoff_attempt = 0
+                    while True:
+                        raw_frame = await ws.recv()
+                        payload: dict[str, Any] = json.loads(raw_frame)
+                        if payload.get("s") is not None:
+                            seq_ref[0] = int(payload["s"])
 
-        raise TRSessionError("Timed out waiting for 4-digit Trade Republic 2FA PIN in Discord")
+                        op = payload.get("op")
+                        event_name = payload.get("t")
+                        data = payload.get("d")
 
-    def prompt_and_wait_for_pin(self) -> str:
-        """Send 2FA prompt to Discord and return the user's 4-to-6-digit verification code."""
-        prompt_id = self.send_message(
-            "🔐 **Trade Republic 2FA Required**\n"
-            "Your Trade Republic session has expired. Please reply in this channel "
-            "with the **6-digit code from your Authenticator app** (or 4-digit verification code)."
-        )
-        pin = self.wait_for_pin(prompt_id)
-        self.send_message("✅ Received verification code. Submitting to Trade Republic...")
-        return pin
+                        if op == 10 and isinstance(data, dict):
+                            interval_s = max(
+                                1.0, float(data.get("heartbeat_interval", 41250)) / 1000.0
+                            )
+                            if heartbeat_task is not None:
+                                heartbeat_task.cancel()
+                            heartbeat_task = asyncio.create_task(
+                                _heartbeat_loop(ws, interval_s, seq_ref, ack_state)
+                            )
+                            await self._send_identify_or_resume(
+                                ws,
+                                session_id=session_id,
+                                seq=seq_ref[0],
+                            )
+                        elif op == 1:
+                            await ws.send(json.dumps({"op": 1, "d": seq_ref[0]}))
+                        elif op == 11:
+                            ack_state[0] = True
+                        elif op == 7:
+                            raise _GatewayReconnectSignal(resumable=True)
+                        elif op == 9:
+                            resumable = bool(data)
+                            if not resumable:
+                                session_id = None
+                                resume_gateway_url = None
+                                seq_ref[0] = None
+                            raise _GatewayReconnectSignal(resumable=resumable)
+                        elif op == 0 and event_name == "READY" and isinstance(data, dict):
+                            session_id = str(data.get("session_id") or "") or None
+                            raw_resume = (
+                                str(data.get("resume_gateway_url") or "").strip().rstrip("/")
+                            )
+                            resume_gateway_url = raw_resume or None
+                            if prompt_id is None:
+                                prompt_id = await asyncio.to_thread(
+                                    self.send_message, active_prompt
+                                )
+                        elif op == 0 and event_name == "RESUMED":
+                            if prompt_id is None:
+                                prompt_id = await asyncio.to_thread(
+                                    self.send_message, active_prompt
+                                )
+                        elif (
+                            op == 0
+                            and event_name == "MESSAGE_CREATE"
+                            and isinstance(data, dict)
+                            and prompt_id is not None
+                        ):
+                            pin = _extract_pin_from_message(
+                                data,
+                                channel_id=self.channel_id,
+                                after_message_id=prompt_id,
+                            )
+                            if pin is not None:
+                                return pin
+            except _GatewayReconnectSignal as sig:
+                logger.info(
+                    "Discord Gateway requested reconnect (resumable=%s); reconnecting",
+                    sig.resumable,
+                )
+            except websockets.exceptions.ConnectionClosed as exc:
+                code, reason = _close_code_and_reason(exc)
+                if code in FATAL_GATEWAY_CLOSE_CODES:
+                    detail = reason or "check token/intents"
+                    raise TRSessionError(
+                        f"Discord Gateway closed fatally ({code}): {detail}"
+                    ) from exc
+                logger.warning(
+                    "Discord Gateway connection closed (code=%s, reason=%s); reconnecting",
+                    code,
+                    reason,
+                )
+            except OSError as exc:
+                logger.warning("Discord Gateway socket error (%s); reconnecting", exc)
+            finally:
+                if heartbeat_task is not None:
+                    heartbeat_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await heartbeat_task
+
+            backoff_attempt += 1
+            delay = min(60.0, float(2 ** min(backoff_attempt, 5)))
+            await self._reconnect_sleep(delay)
+
+    def prompt_and_wait_for_pin(self, prompt_message: str | None = None) -> str:
+        """Prompt in Discord and wait indefinitely via Gateway events for a 4-6 digit code."""
+        return asyncio.run(self.prompt_and_wait_for_pin_async(prompt_message))
 
 
 class TRSessionManager:
@@ -152,17 +335,12 @@ class TRSessionManager:
             encoding="utf-8",
         )
 
-    def ensure_authenticated(self) -> Any:
-        """Ensure an authenticated pytr client is ready, renewing via Discord 2FA if needed."""
+    def _perform_weblogin(self, code: str) -> None:
+        """Initiate Trade Republic web login and verify using the provided 2FA code."""
         if self._tr_api is None:
             self._tr_api = self._create_tr_api()
 
-        if self.has_valid_session():
-            resume = getattr(self._tr_api, "resume_websession", None)
-            if callable(resume) and resume():
-                return self._tr_api
-
-        logger.info("Initiating Trade Republic weblogin and requesting 2FA via Discord")
+        logger.info("Initiating Trade Republic weblogin after receiving 2FA code")
         initiate = getattr(self._tr_api, "initiate_weblogin", None)
         if callable(initiate):
             initiate()
@@ -176,7 +354,6 @@ class TRSessionManager:
         )
         complete = getattr(self._tr_api, "complete_weblogin", None)
         if needs_auth_code:
-            code = self.discord_client.prompt_and_wait_for_pin()
             if callable(complete):
                 complete(code)
             get_proc = getattr(self._tr_api, "_get_weblogin_process", None)
@@ -210,6 +387,43 @@ class TRSessionManager:
             if callable(complete):
                 complete()
             self.discord_client.send_message("✅ Trade Republic login confirmed in mobile app.")
+
+    def ensure_authenticated(self) -> Any:
+        """Ensure an authenticated pytr client is ready, renewing via Discord 2FA if needed."""
+        if self._tr_api is None:
+            self._tr_api = self._create_tr_api()
+
+        if self.has_valid_session():
+            resume = getattr(self._tr_api, "resume_websession", None)
+            if callable(resume) and resume():
+                return self._tr_api
+
+        prompt_message: str | None = None
+        while True:
+            code = self.discord_client.prompt_and_wait_for_pin(prompt_message)
+            self.discord_client.send_message(
+                "🔄 Received verification code. Starting Trade Republic login..."
+            )
+            try:
+                self._perform_weblogin(code)
+                break
+            except Exception as exc:
+                raw_error = str(exc) or type(exc).__name__
+                safe_error = (
+                    raw_error.replace(self.pin, "***")
+                    if self.pin and len(self.pin) >= 4
+                    else raw_error
+                )
+                logger.warning(
+                    "Trade Republic login attempt failed (%s); waiting for new 2FA code",
+                    safe_error,
+                )
+                self._tr_api = None
+                prompt_message = (
+                    f"❌ **Trade Republic login failed:** {safe_error}\n"
+                    "Whenever you are ready, please reply with a "
+                    "**new 6-digit Authenticator code**."
+                )
 
         if not self.cookies_file.exists():
             self.cookies_file.write_text("# pytr cookies\n", encoding="utf-8")
