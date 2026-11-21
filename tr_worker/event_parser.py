@@ -493,9 +493,9 @@ def parse_tr_stock_trades(events: Sequence[dict[str, Any]]) -> list[StockTradeIn
                 symbol=symbol,
                 isin=isin,
                 quantity=shares,
-                price=price,
+                price=Decimal("0") if is_saveback else price,
                 price_currency=currency,
-                cash_amount_eur=abs(raw_amount),
+                cash_amount_eur=Decimal("0") if is_saveback else abs(raw_amount),
                 side="BUY",
             )
         )

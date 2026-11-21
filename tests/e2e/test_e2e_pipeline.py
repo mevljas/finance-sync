@@ -308,3 +308,105 @@ def test_e2e_cli_dry_run_flags_and_json_report_export(
     assert wallet.compute_account_view(tr_cash_acc)["recordStats"]["recordCount"] == 2
     assert wallet.compute_account_view(tr_wealth_acc)["recordStats"]["recordCount"] == 0
     get_settings.cache_clear()
+
+
+@respx.mock
+def test_e2e_ibkr_cli_couchdb_zero_cost_baseline_dry_run_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify ibkr_worker CLI exports zero-cost baseline CouchDB docs in dry-run preview."""
+    ibkr_acc = "00000000-0000-0000-0000-000000000001"
+    couch_user = "00000000-0000-0000-0000-000000000055"
+    db_file = tmp_path / "ibkr_couch_e2e.db"
+    report_file = tmp_path / "ibkr_couch_preview.json"
+
+    monkeypatch.setenv("USE_MOCK_DATA", "true")
+    monkeypatch.setenv("DRY_RUN", "false")
+    monkeypatch.setenv("SQLITE_DB_PATH", str(db_file))
+    monkeypatch.setenv("BUDGETBAKERS_TOKEN", "e2e-jwt-token")
+    monkeypatch.setenv("BB_IBKR_ACCOUNT_ID", ibkr_acc)
+    monkeypatch.setenv("BB_COUCHDB_USER", couch_user)
+    monkeypatch.setenv("BB_COUCHDB_PASSWORD", "test-couch-password")
+    monkeypatch.setenv("IBKR_ZERO_COST_BASELINE_ASSETS", "FAKE")
+    get_settings.cache_clear()
+
+    wallet = StatefulWalletMock(
+        ibkr_acc,
+        "00000000-0000-0000-0000-000000000002",
+        "00000000-0000-0000-0000-000000000003",
+    )
+    respx.get("https://rest.budgetbakers.com/wallet/v1/api/accounts").mock(
+        side_effect=wallet.handle_get_accounts
+    )
+    respx.get("https://rest.budgetbakers.com/wallet/v1/api/records").mock(
+        side_effect=wallet.handle_get_records
+    )
+
+    assert ibkr_main(["--once", "--dry-run", "--dry-run-output", str(report_file)]) == 0
+    report = json.loads(report_file.read_text(encoding="utf-8"))
+    baseline_docs = [
+        d
+        for d in report["would_upsert_couchdb_docs"]
+        if d.get("reservedSource") == "finance-sync-baseline"
+    ]
+    assert len(baseline_docs) == 1
+    assert baseline_docs[0]["quantity"] == 85.0
+    assert baseline_docs[0]["cashAmount"] == 0
+    assert baseline_docs[0]["price"] == 0
+    get_settings.cache_clear()
+
+
+@respx.mock
+def test_e2e_tr_cli_couchdb_saveback_zero_cost_dry_run_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify tr_worker CLI exports zero-cost Saveback CouchDB docs in dry-run preview."""
+    from uuid import NAMESPACE_URL, uuid5
+
+    tr_cash_acc = "00000000-0000-0000-0000-000000000002"
+    tr_wealth_acc = "00000000-0000-0000-0000-000000000003"
+    couch_user = "00000000-0000-0000-0000-000000000055"
+    db_file = tmp_path / "tr_couch_e2e.db"
+    report_file = tmp_path / "tr_couch_preview.json"
+
+    monkeypatch.setenv("USE_MOCK_DATA", "true")
+    monkeypatch.setenv("DRY_RUN", "false")
+    monkeypatch.setenv("SQLITE_DB_PATH", str(db_file))
+    monkeypatch.setenv("BUDGETBAKERS_TOKEN", "e2e-jwt-token")
+    monkeypatch.setenv("BB_TR_CASH_ACCOUNT_ID", tr_cash_acc)
+    monkeypatch.setenv("BB_TR_WEALTH_ACCOUNT_ID", tr_wealth_acc)
+    monkeypatch.setenv("BB_COUCHDB_USER", couch_user)
+    monkeypatch.setenv("BB_COUCHDB_PASSWORD", "test-couch-password")
+    monkeypatch.setenv("TR_SESSION_DIR", str(tmp_path / "tr_sess"))
+    get_settings.cache_clear()
+
+    wallet = StatefulWalletMock(
+        "00000000-0000-0000-0000-000000000001",
+        tr_cash_acc,
+        tr_wealth_acc,
+    )
+    respx.get("https://rest.budgetbakers.com/wallet/v1/api/accounts").mock(
+        side_effect=wallet.handle_get_accounts
+    )
+    respx.get("https://rest.budgetbakers.com/wallet/v1/api/records").mock(
+        side_effect=wallet.handle_get_records
+    )
+
+    assert tr_main(["--once", "--dry-run", "--dry-run-output", str(report_file)]) == 0
+    report = json.loads(report_file.read_text(encoding="utf-8"))
+    tx_docs = {
+        d["_id"]: d
+        for d in report["would_upsert_couchdb_docs"]
+        if d.get("reservedModelType") == "AssetTransaction"
+    }
+    saveback_uuid = uuid5(NAMESPACE_URL, "finance-sync:tx:tr:tr-saveback-2026-11:saveback")
+    saveback_id = f"-AssetTransaction_{saveback_uuid}"
+    sparplan_id = (
+        f"-AssetTransaction_{uuid5(NAMESPACE_URL, 'finance-sync:tx:tr:tr-sparplan-2026-10')}"
+    )
+    assert tx_docs[saveback_id]["cashAmount"] == 0
+    assert tx_docs[saveback_id]["price"] == 0
+    assert tx_docs[sparplan_id]["cashAmount"] == 5000
+    get_settings.cache_clear()

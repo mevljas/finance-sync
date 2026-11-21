@@ -25,7 +25,7 @@ Additionally, for Trade Republic Savings Plans, the outgoing cash deduction on `
 2. **Paired Transfers for Trade Republic Savings Plans**:
    - When `settings.has_couchdb == True`, `parse_tr_timeline_events()` emits each Trade Republic Savings Plan on `BB_TR_CASH_ACCOUNT_ID` with `transfer: {"pairingMode": "new", "accountId": "<BB_TR_WEALTH_ACCOUNT_ID>"}` and omits `categoryId` (as required by BudgetBakers' REST schema when `transfer` is set).
    - BudgetBakers automatically creates the paired incoming transfer on `BB_TR_WEALTH_ACCOUNT_ID`.
-   - `1% Saveback` is paid directly in fractional shares by Trade Republic and does not deduct from `BB_TR_CASH_ACCOUNT_ID`, so it is written exclusively as a CouchDB `-AssetTransaction` on `BB_TR_WEALTH_ACCOUNT_ID`.
+   - `1% Saveback` is paid directly in fractional shares by Trade Republic and does not deduct from `BB_TR_CASH_ACCOUNT_ID`, so it is written exclusively as a CouchDB `-AssetTransaction` on `BB_TR_WEALTH_ACCOUNT_ID` *(updated by [ADR-0013](./0013-tr-saveback-zero-cost-asset-transactions.md) to set `cashAmount: 0` and `price: 0`)*.
 
 3. **Uninvested Cash Balance Reconciliation**:
    - BudgetBakers Wallet's web/mobile UI computes an investment account's cash balance by subtracting all CouchDB `BUY` `-AssetTransaction.cashAmount` entries (and adding `SELL` entries) from the REST formula (`initial + totalIncomes - totalExpenses`).

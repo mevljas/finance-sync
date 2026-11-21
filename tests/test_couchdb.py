@@ -223,7 +223,11 @@ def test_tr_event_parser_with_couchdb_creates_paired_transfer(test_settings: Set
     stock_trades = parse_tr_stock_trades(events)
     assert len(stock_trades) == 2
     assert stock_trades[0].external_id == "tr-saveback-001:saveback"
+    assert stock_trades[0].price == Decimal("0")
+    assert stock_trades[0].cash_amount_eur == Decimal("0")
     assert stock_trades[1].external_id == "tr-sparplan-001"
+    assert stock_trades[1].price == Decimal("540.54")
+    assert stock_trades[1].cash_amount_eur == Decimal("50.0")
 
 
 def test_ibkr_and_tr_workers_with_couchdb_dry_run(
@@ -280,3 +284,240 @@ def test_parse_tr_live_positions_extracts_positions() -> None:
     assert len(positions) == 1
     assert positions[0].isin == "IE00B3WJKG14"
     assert positions[0].quantity == Decimal("38.732664")
+
+
+def test_couchdb_zero_cost_baseline_upserts_in_place_and_handles_partial_sell() -> None:
+    from uuid import NAMESPACE_URL, uuid5
+
+    account_id = "00000000-0000-0000-0000-000000000001"
+    asset_uuid = uuid5(NAMESPACE_URL, "finance-sync:asset:XNGS:FAKEGIFT")
+    asset_id = f"-StocksFundsAsset_{asset_uuid}"
+    base_uuid = uuid5(NAMESPACE_URL, f"finance-sync:baseline:{account_id}:{asset_id}")
+    base_doc_id = f"-AssetTransaction_{base_uuid}"
+
+    existing_tx_docs: list[dict[str, Any]] = [
+        {
+            "_id": base_doc_id,
+            "_rev": "1-00000001",
+            "accountId": f"-Account_{account_id}",
+            "assetId": asset_id,
+            "assetType": 0,
+            "transactionType": 0,
+            "quantity": 6.7471,
+            "cashAmount": 43793,
+            "price": 7119,
+            "date": "2025-01-01T00:00:00.000Z",
+            "financeSyncIsin": "US0000000002",
+            "reservedSource": "finance-sync-baseline",
+        }
+    ]
+    existing_assets: list[dict[str, Any]] = [
+        {
+            "_id": asset_id,
+            "symbol": "FAKEGIFT",
+            "exchangeCode": "XNGS",
+            "currencyCode": "USD",
+            "financeSyncIsin": "US0000000002",
+        }
+    ]
+    bulk_payloads: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and "_all_docs" in str(request.url):
+            startkey = request.url.params.get("startkey", "")
+            if "-StocksFundsAsset_" in startkey:
+                return httpx.Response(200, json={"rows": [{"doc": d} for d in existing_assets]})
+            if "-AssetTransaction_" in startkey:
+                return httpx.Response(200, json={"rows": [{"doc": d} for d in existing_tx_docs]})
+        if request.method == "POST" and "_bulk_docs" in str(request.url):
+            payload = json.loads(request.content.decode("utf-8"))
+            bulk_payloads.append(payload)
+            return httpx.Response(201, json=[{"ok": True} for _ in payload["docs"]])
+        return httpx.Response(404)
+
+    http_client = httpx.Client(transport=httpx.MockTransport(handler))
+    with CouchDBStockSyncClient(
+        owner_id="00000000-0000-0000-0000-000000000055",
+        password="test-password",
+        http_client=http_client,
+    ) as client:
+        # 1. Existing paid baseline for FAKEGIFT is migrated in-place to cashAmount=0, price=0,
+        #    while an unmatched paid position (FAKEPAID) keeps its mark-price baseline.
+        res1 = client.sync_account_holdings(
+            broker="ibkr",
+            account_id=account_id,
+            trades=[],
+            live_positions=[
+                LivePositionInput(
+                    symbol="FAKEGIFT",
+                    isin="US0000000002",
+                    quantity=Decimal("6.7471"),
+                    unit_price=Decimal("71.19"),
+                    unit_price_currency="USD",
+                    unit_price_eur=Decimal("64.91"),
+                ),
+                LivePositionInput(
+                    symbol="FAKEPAID",
+                    isin="XF0000000099",
+                    quantity=Decimal("10.0"),
+                    unit_price=Decimal("100.00"),
+                    unit_price_currency="EUR",
+                    unit_price_eur=Decimal("100.00"),
+                ),
+            ],
+            zero_cost_baseline_assets={"FAKEGIFT"},
+        )
+        assert res1.transactions_upserted == 2
+        assert res1.transactions_deleted == 0
+        assert res1.net_cash_invested_eur == 1000.0
+        docs_by_isin = {
+            d["financeSyncIsin"]: d
+            for d in bulk_payloads[0]["docs"]
+            if d.get("reservedSource") == "finance-sync-baseline"
+        }
+        updated_base = docs_by_isin["US0000000002"]
+        assert updated_base["_id"] == base_doc_id
+        assert updated_base["_rev"] == "1-00000001"
+        assert updated_base["quantity"] == 6.7471
+        assert updated_base["cashAmount"] == 0
+        assert updated_base["price"] == 0
+        paid_base = docs_by_isin["XF0000000099"]
+        assert paid_base["quantity"] == 10.0
+        assert paid_base["cashAmount"] == 100000
+        assert paid_base["price"] == 10000
+
+        # Simulate CouchDB now storing the updated zero-cost baseline
+        existing_tx_docs[0] = {**updated_base, "_rev": "2-00000002"}
+
+        # 2. Later partial SELL preserves full 6.7471 baseline at €0 cost and subtracts proceeds
+        res2 = client.sync_account_holdings(
+            broker="ibkr",
+            account_id=account_id,
+            trades=[
+                StockTradeInput(
+                    external_id="S2001",
+                    timestamp="2026-11-20T15:00:00Z",
+                    symbol="FAKEGIFT",
+                    isin="US0000000002",
+                    quantity=Decimal("2.0"),
+                    price=Decimal("72.50"),
+                    price_currency="USD",
+                    cash_amount_eur=Decimal("130.00"),
+                    side="SELL",
+                )
+            ],
+            live_positions=[
+                LivePositionInput(
+                    symbol="FAKEGIFT",
+                    isin="US0000000002",
+                    quantity=Decimal("4.7471"),
+                    unit_price=Decimal("72.50"),
+                    unit_price_currency="USD",
+                    unit_price_eur=Decimal("65.00"),
+                )
+            ],
+            zero_cost_baseline_assets={"FAKEGIFT"},
+        )
+        assert res2.transactions_upserted == 1  # only the new SELL tx; baseline unchanged
+        assert res2.net_cash_invested_eur == -130.0
+        sell_doc = bulk_payloads[1]["docs"][0]
+        assert sell_doc["transactionType"] == 1
+        assert sell_doc["quantity"] == 2.0
+        assert sell_doc["cashAmount"] == 13000
+
+    http_client.close()
+
+
+def test_couchdb_zero_cost_saveback_trade_migrates_in_place() -> None:
+    from uuid import NAMESPACE_URL, uuid5
+
+    account_id = "00000000-0000-0000-0000-000000000003"
+    asset_uuid = uuid5(NAMESPACE_URL, "finance-sync:asset:XETR:VWCE")
+    asset_id = f"-StocksFundsAsset_{asset_uuid}"
+    saveback_tx_id = (
+        f"-AssetTransaction_{uuid5(NAMESPACE_URL, 'finance-sync:tx:tr:tr-sb-1:saveback')}"
+    )
+
+    existing_tx_docs: list[dict[str, Any]] = [
+        {
+            "_id": saveback_tx_id,
+            "_rev": "1-00000001",
+            "accountId": f"-Account_{account_id}",
+            "assetId": asset_id,
+            "assetType": 0,
+            "transactionType": 0,
+            "quantity": 0.1196,
+            "cashAmount": 1500,
+            "price": 12542,
+            "date": "2026-03-02T08:00:00.000Z",
+            "financeSyncIsin": "IE00BK5BQT80",
+            "reservedSource": "finance-sync-tx",
+        }
+    ]
+    existing_assets: list[dict[str, Any]] = [
+        {
+            "_id": asset_id,
+            "symbol": "VWCE",
+            "exchangeCode": "XETR",
+            "currencyCode": "EUR",
+            "financeSyncIsin": "IE00BK5BQT80",
+        }
+    ]
+    bulk_payloads: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and "_all_docs" in str(request.url):
+            startkey = request.url.params.get("startkey", "")
+            if "-StocksFundsAsset_" in startkey:
+                return httpx.Response(200, json={"rows": [{"doc": d} for d in existing_assets]})
+            if "-AssetTransaction_" in startkey:
+                return httpx.Response(200, json={"rows": [{"doc": d} for d in existing_tx_docs]})
+        if request.method == "POST" and "_bulk_docs" in str(request.url):
+            payload = json.loads(request.content.decode("utf-8"))
+            bulk_payloads.append(payload)
+            return httpx.Response(201, json=[{"ok": True} for _ in payload["docs"]])
+        return httpx.Response(404)
+
+    http_client = httpx.Client(transport=httpx.MockTransport(handler))
+    with CouchDBStockSyncClient(
+        owner_id="00000000-0000-0000-0000-000000000055",
+        password="test-password",
+        http_client=http_client,
+    ) as client:
+        res = client.sync_account_holdings(
+            broker="tr",
+            account_id=account_id,
+            trades=[
+                StockTradeInput(
+                    external_id="tr-sb-1:saveback",
+                    timestamp="2026-03-02T08:00:00Z",
+                    symbol="VWCE",
+                    isin="IE00BK5BQT80",
+                    quantity=Decimal("0.1196"),
+                    price=Decimal("0"),
+                    price_currency="EUR",
+                    cash_amount_eur=Decimal("0"),
+                    side="BUY",
+                )
+            ],
+            live_positions=[
+                LivePositionInput(
+                    symbol="VWCE",
+                    isin="IE00BK5BQT80",
+                    quantity=Decimal("0.1196"),
+                    unit_price=Decimal("125.42"),
+                    unit_price_currency="EUR",
+                    unit_price_eur=Decimal("125.42"),
+                )
+            ],
+        )
+
+    http_client.close()
+    assert res.transactions_upserted == 1
+    assert res.transactions_deleted == 0
+    assert res.net_cash_invested_eur == 0.0
+    migrated = bulk_payloads[0]["docs"][0]
+    assert migrated["_id"] == saveback_tx_id
+    assert migrated["_rev"] == "1-00000001"
+    assert migrated["cashAmount"] == 0
+    assert migrated["price"] == 0

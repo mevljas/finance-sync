@@ -297,3 +297,77 @@ def test_ibkr_main_notifies_discord_on_sync_error_when_configured(
     body = json.loads(discord_route.calls[0].request.content)
     assert "IBKR" in body["content"]
     assert "IBKR Flex 503" in body["content"]
+
+
+@respx.mock
+def test_ibkr_worker_couchdb_uses_zero_cost_baseline(
+    test_settings: Settings,
+    dedup_store: DeduplicationStore,
+) -> None:
+    """Verify IBKRWorker only zeros baselines listed in IBKR_ZERO_COST_BASELINE_ASSETS."""
+    from pydantic import SecretStr
+
+    # Default IBKR_ZERO_COST_BASELINE_ASSETS="IBKR" leaves FAKE baseline at mark price
+    default_settings = test_settings.model_copy(
+        update={
+            "use_mock_data": True,
+            "bb_couchdb_user": "00000000-0000-0000-0000-000000000055",
+            "bb_couchdb_password": SecretStr("test-password"),
+        }
+    )
+    assert default_settings.zero_cost_baseline_asset_set == frozenset({"IBKR"})
+
+    settings = default_settings.model_copy(update={"ibkr_zero_cost_baseline_assets": "FAKE"})
+    acc_id = settings.bb_ibkr_account_id
+    couch_base = f"https://couch-prod-eu-2.budgetbakers.com/bb-{settings.bb_couchdb_user}"
+
+    respx.get(f"{couch_base}/_all_docs").mock(return_value=httpx.Response(200, json={"rows": []}))
+    couch_bulk_route = respx.post(f"{couch_base}/_bulk_docs").mock(
+        return_value=httpx.Response(
+            201, json=[{"ok": True}, {"ok": True}, {"ok": True}, {"ok": True}]
+        )
+    )
+    respx.get("https://rest.budgetbakers.com/wallet/v1/api/records").mock(
+        return_value=httpx.Response(200, json={"records": []})
+    )
+    respx.post("https://rest.budgetbakers.com/wallet/v1/api/records").mock(
+        return_value=httpx.Response(200, json={"results": [{"id": "div-1", "success": True}]})
+    )
+    respx.get("https://rest.budgetbakers.com/wallet/v1/api/accounts").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "accounts": [
+                    {
+                        "id": acc_id,
+                        "recordStats": {"totalIncomes": 25.00, "totalExpenses": 0.00},
+                    }
+                ]
+            },
+        )
+    )
+    patch_acc_route = respx.patch("https://rest.budgetbakers.com/wallet/v1/api/accounts").mock(
+        return_value=httpx.Response(200, json={"results": [{"id": acc_id, "success": True}]})
+    )
+
+    with BudgetBakersClient(token="test-token") as bb_client:
+        worker = IBKRWorker(settings=settings, db=dedup_store, bb_client=bb_client)
+        try:
+            summary = worker.sync_once()
+        finally:
+            worker.close()
+
+    assert summary.trades_synced == 3  # 2 real trades + 1 baseline (85 shares)
+    assert summary.cash_events_synced == 1
+    assert couch_bulk_route.call_count == 1
+    bulk_docs = json.loads(couch_bulk_route.calls[0].request.content)["docs"]
+    baseline_docs = [d for d in bulk_docs if d.get("reservedSource") == "finance-sync-baseline"]
+    assert len(baseline_docs) == 1
+    assert baseline_docs[0]["quantity"] == 85.0
+    assert baseline_docs[0]["cashAmount"] == 0
+    assert baseline_docs[0]["price"] == 0
+
+    # Target = ending_cash (100.00) + paid trades net_cash_invested_eur (1502.00) = 1602.00
+    # initial = 1602.00 - 25.00 + 0.00 = 1577.00
+    assert summary.patched_initial_balance == 1577.00
+    assert patch_acc_route.call_count == 1

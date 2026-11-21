@@ -275,3 +275,81 @@ def test_tr_main_notifies_discord_on_sync_error_when_configured(
     body = json.loads(discord_route.calls[0].request.content)
     assert "Trade Republic" in body["content"]
     assert "TR WebSocket timeout" in body["content"]
+
+
+@respx.mock
+def test_tr_worker_couchdb_syncs_saveback_as_zero_cost(
+    test_settings: Settings,
+    dedup_store: DeduplicationStore,
+) -> None:
+    """Verify TRWorker syncs 1% Saveback with cashAmount=0 and price=0 in CouchDB."""
+    from uuid import NAMESPACE_URL, uuid5
+
+    from pydantic import SecretStr
+
+    settings = test_settings.model_copy(
+        update={
+            "use_mock_data": True,
+            "bb_couchdb_user": "00000000-0000-0000-0000-000000000055",
+            "bb_couchdb_password": SecretStr("test-password"),
+        }
+    )
+    wealth_acc = settings.bb_tr_wealth_account_id
+    couch_base = f"https://couch-prod-eu-2.budgetbakers.com/bb-{settings.bb_couchdb_user}"
+
+    respx.get(f"{couch_base}/_all_docs").mock(return_value=httpx.Response(200, json={"rows": []}))
+    couch_bulk_route = respx.post(f"{couch_base}/_bulk_docs").mock(
+        return_value=httpx.Response(
+            201, json=[{"ok": True}, {"ok": True}, {"ok": True}, {"ok": True}]
+        )
+    )
+    respx.get("https://rest.budgetbakers.com/wallet/v1/api/records").mock(
+        return_value=httpx.Response(200, json={"records": []})
+    )
+    respx.post("https://rest.budgetbakers.com/wallet/v1/api/records").mock(
+        return_value=httpx.Response(
+            200, json={"results": [{"id": f"new-{i}", "success": True} for i in range(8)]}
+        )
+    )
+    respx.get("https://rest.budgetbakers.com/wallet/v1/api/accounts").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "accounts": [
+                    {
+                        "id": wealth_acc,
+                        "recordStats": {"totalIncomes": 10.00, "totalExpenses": 0.00},
+                    }
+                ]
+            },
+        )
+    )
+    patch_route = respx.patch("https://rest.budgetbakers.com/wallet/v1/api/accounts").mock(
+        return_value=httpx.Response(200, json={"results": [{"id": wealth_acc, "success": True}]})
+    )
+
+    with BudgetBakersClient(token="test-token") as bb_client:
+        worker = TRWorker(settings=settings, db=dedup_store, bb_client=bb_client)
+        try:
+            summary = worker.sync_once()
+        finally:
+            worker.close()
+
+    assert couch_bulk_route.call_count == 1
+    bulk_docs = json.loads(couch_bulk_route.calls[0].request.content)["docs"]
+    tx_docs = {d["_id"]: d for d in bulk_docs if d.get("reservedModelType") == "AssetTransaction"}
+    saveback_uuid = uuid5(NAMESPACE_URL, "finance-sync:tx:tr:tr-saveback-2026-11:saveback")
+    saveback_id = f"-AssetTransaction_{saveback_uuid}"
+    sparplan_id = (
+        f"-AssetTransaction_{uuid5(NAMESPACE_URL, 'finance-sync:tx:tr:tr-sparplan-2026-10')}"
+    )
+
+    assert tx_docs[saveback_id]["cashAmount"] == 0
+    assert tx_docs[saveback_id]["price"] == 0
+    assert tx_docs[sparplan_id]["cashAmount"] == 5000
+    assert tx_docs[sparplan_id]["price"] == 10000
+
+    # Target = paid sparplan (50.00) + baseline (935.00) = 985.00 (Saveback 15.00 excluded)
+    # initial = 985.00 - 10.00 + 0.00 = 975.00
+    assert summary.patched_wealth_initial_balance == 975.00
+    assert patch_route.call_count == 1

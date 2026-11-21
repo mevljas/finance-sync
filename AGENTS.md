@@ -23,6 +23,8 @@ Before modifying code, consult these source-of-truth documents in `docs/`:
   - [`0009-scheduled-sync-start-time.md`](./docs/adr/0009-scheduled-sync-start-time.md)
   - [`0010-discord-error-notifications.md`](./docs/adr/0010-discord-error-notifications.md)
   - [`0011-discord-gateway-ready-first-2fa.md`](./docs/adr/0011-discord-gateway-ready-first-2fa.md)
+  - [`0012-ibkr-zero-cost-baseline-stock-grants.md`](./docs/adr/0012-ibkr-zero-cost-baseline-stock-grants.md)
+  - [`0013-tr-saveback-zero-cost-asset-transactions.md`](./docs/adr/0013-tr-saveback-zero-cost-asset-transactions.md)
 
 ---
 

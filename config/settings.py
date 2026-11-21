@@ -212,6 +212,19 @@ class Settings(BaseSettings):
         default=10.0,
         alias="IBKR_FLEX_WAIT_SECONDS",
     )
+    ibkr_zero_cost_baseline_assets: str = Field(
+        default="IBKR",
+        alias="IBKR_ZERO_COST_BASELINE_ASSETS",
+    )
+
+    @property
+    def zero_cost_baseline_asset_set(self) -> frozenset[str]:
+        """Return uppercase symbols/ISINs whose IBKR baseline shares have zero cost."""
+        return frozenset(
+            item.strip().upper()
+            for item in self.ibkr_zero_cost_baseline_assets.split(",")
+            if item.strip()
+        )
 
     # Trade Republic Private API
     tr_phone_no: str = Field(

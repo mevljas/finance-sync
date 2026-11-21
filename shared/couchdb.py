@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -222,6 +222,8 @@ class CouchDBStockSyncClient:
         live_positions: Sequence[LivePositionInput],
         purge_existing: bool = False,
         delete_doc_ids: Sequence[str] | None = None,
+        zero_cost_baseline: bool = False,
+        zero_cost_baseline_assets: Collection[str] = (),
     ) -> CouchDBSyncResult:
         """Reconcile -StocksFundsAsset and -AssetTransaction documents for an investment account."""
         now_iso = _normalize_couch_iso(datetime.now(tz=UTC).isoformat())
@@ -335,8 +337,8 @@ class CouchDBStockSyncClient:
             tx_doc_id = f"-AssetTransaction_{tx_uuid}"
             tx_type = 1 if trade.side.upper() == "SELL" else 0
             qty_float = round(float(abs(trade.quantity)), 6)
-            price_cents = max(1, round(float(abs(trade.price)) * 100))
-            cash_cents = max(1, round(float(abs(trade.cash_amount_eur)) * 100))
+            price_cents = max(0, round(float(abs(trade.price)) * 100))
+            cash_cents = max(0, round(float(abs(trade.cash_amount_eur)) * 100))
             norm_date = _normalize_couch_iso(trade.timestamp)
 
             prev_doc = existing_tx_by_id.get(tx_doc_id)
@@ -366,6 +368,9 @@ class CouchDBStockSyncClient:
             desired_tx_docs[tx_doc_id] = tx_doc
 
         # 2. Reconcile baseline pre-window shares per live position so total shares match broker
+        zero_cost_asset_set = {
+            item.strip().upper() for item in zero_cost_baseline_assets if item.strip()
+        }
         for pos in live_positions:
             asset_id, asset_currency = ensure_asset_id(
                 pos.isin,
@@ -393,11 +398,19 @@ class CouchDBStockSyncClient:
                     str(prev_base.get("reservedCreatedAt") or now_iso) if prev_base else now_iso
                 )
                 qty_f = round(float(baseline_shares), 6)
-                price_cents = max(1, round(float(abs(pos.unit_price)) * 100))
-                cash_cents = max(
-                    1,
-                    round(float(baseline_shares * abs(pos.unit_price_eur)) * 100),
+                is_zero_cost_baseline = zero_cost_baseline or (
+                    pos.symbol.strip().upper() in zero_cost_asset_set
+                    or pos.isin.strip().upper() in zero_cost_asset_set
                 )
+                if is_zero_cost_baseline:
+                    price_cents = 0
+                    cash_cents = 0
+                else:
+                    price_cents = max(1, round(float(abs(pos.unit_price)) * 100))
+                    cash_cents = max(
+                        1,
+                        round(float(baseline_shares * abs(pos.unit_price_eur)) * 100),
+                    )
                 base_doc: dict[str, Any] = {
                     "_id": base_doc_id,
                     "date": "2025-01-01T00:00:00.000Z",

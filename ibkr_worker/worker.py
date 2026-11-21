@@ -206,6 +206,7 @@ class IBKRWorker:
                 live_positions=couch_positions,
                 purge_existing=purge_existing_records,
                 delete_doc_ids=couch_delete_ids,
+                zero_cost_baseline_assets=self.settings.zero_cost_baseline_asset_set,
             )
             trades_synced = couch_result.transactions_upserted
             net_couch_cash_eur = couch_result.net_cash_invested_eur
