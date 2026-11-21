@@ -380,3 +380,164 @@ def test_discord_2fa_6_digit_authenticator_and_mobile_confirm(tmp_path: Path) ->
     manager.ensure_authenticated()
     assert events_called == ["initiate", "complete:000000", "await_confirm", "save"]
     discord_client.close()
+
+
+def test_resolve_merchant_category_normalization_sl_eu_and_precedence(
+    test_settings: Settings,
+) -> None:
+    """Verify hyphen normalization, Slovenian/EU keywords, MCC, TR hints, and precedence."""
+    assert (
+        test_settings.resolve_merchant_category("dm-drogerie")
+        == "5c5c07db-0014-8000-8000-000000000000"
+    )
+    assert test_settings.resolve_merchant_category("Restavracija Fresco") == CATEGORY_RESTAURANTS
+    assert test_settings.resolve_merchant_category("PEKARNA CENTER") == CATEGORY_GROCERIES
+    # Specific merchant keyword wins over generic retail MCC (5999)
+    assert (
+        test_settings.resolve_merchant_category("dm-drogerie", mcc="5999")
+        == "5c5c07db-0014-8000-8000-000000000000"
+    )
+    # Unknown merchant resolves via MCC, then TR semantic hint
+    assert (
+        test_settings.resolve_merchant_category("XYZZY Place", mcc="5812") == CATEGORY_RESTAURANTS
+    )
+    assert (
+        test_settings.resolve_merchant_category("XYZZY Place", tr_hint="groceries")
+        == CATEGORY_GROCERIES
+    )
+
+
+def test_parse_tr_card_events_extracts_detail_v2_mcc_and_icon_hints(
+    test_settings: Settings,
+) -> None:
+    """Verify card transactions extract MCC, detail category, and merchant-fallback icons."""
+    events: list[dict[str, Any]] = [
+        {
+            "id": "card-mcc-1",
+            "timestamp": "2026-11-16T10:00:00Z",
+            "eventType": "card_successful_transaction",
+            "title": "Local Bistro XY",
+            "subtitle": "Card payment",
+            "status": "EXECUTED",
+            "amount": {"value": -12.50, "currency": "EUR"},
+            "details": {
+                "sections": [
+                    {
+                        "title": "Overview",
+                        "data": [{"title": "MCC", "detail": {"text": "5812"}}],
+                    }
+                ]
+            },
+        },
+        {
+            "id": "card-icon-2",
+            "timestamp": "2026-11-16T11:00:00Z",
+            "eventType": "card_successful_transaction",
+            "title": "City Transit XY",
+            "subtitle": "Card payment",
+            "icon": "logos/merchant-fallback-transport/v2",
+            "status": "EXECUTED",
+            "amount": {"value": -2.60, "currency": "EUR"},
+        },
+        {
+            "id": "card-cat-3",
+            "timestamp": "2026-11-16T12:00:00Z",
+            "eventType": "card_successful_transaction",
+            "title": "Apoteka XY",
+            "subtitle": "Card payment",
+            "status": "EXECUTED",
+            "amount": {"value": -8.40, "currency": "EUR"},
+            "details": {
+                "sections": [
+                    {
+                        "title": "Details",
+                        "data": [{"title": "Category", "detail": {"text": "Drugstore"}}],
+                    }
+                ]
+            },
+        },
+    ]
+
+    parsed = parse_tr_timeline_events(events, test_settings)
+    by_id = {rec.external_id: rec for rec in parsed}
+    assert by_id["card-mcc-1"].payload.category_id == CATEGORY_RESTAURANTS
+    assert by_id["card-icon-2"].payload.category_id == "5c5c0fa4-0028-8000-8000-000000000000"
+    assert by_id["card-cat-3"].payload.category_id == "5c5c07db-0014-8000-8000-000000000000"
+
+
+def test_tr_session_manager_fetches_detail_v2_only_for_post_cutoff_card_events(
+    tmp_path: Path,
+) -> None:
+    """Verify _fetch_ws_data_async fetches timeline_detail_v2 only for post-cutoff card events."""
+    import asyncio
+    from datetime import UTC, datetime
+
+    detail_calls: list[str] = []
+
+    class FakeCardTRApi:
+        def __init__(self) -> None:
+            self._responses: list[Any] = [
+                {
+                    "items": [
+                        {
+                            "id": "card-old-1",
+                            "timestamp": "2026-10-28T10:00:00Z",
+                            "eventType": "card_successful_transaction",
+                            "title": "Old Merchant",
+                            "subtitle": "Card payment",
+                            "action": {"type": "timelineDetail", "payload": "card-old-1"},
+                        },
+                        {
+                            "id": "card-new-1",
+                            "timestamp": "2026-11-16T10:00:00Z",
+                            "eventType": "card_successful_transaction",
+                            "title": "New Merchant",
+                            "subtitle": "Card payment",
+                            "action": {"type": "timelineDetail", "payload": "card-new-1"},
+                        },
+                    ],
+                    "cursors": {},
+                },
+                {
+                    "sections": [
+                        {
+                            "title": "Overview",
+                            "data": [{"title": "MCC", "detail": {"text": "5812"}}],
+                        }
+                    ]
+                },
+                {"netValue": 0.0, "positions": []},
+                [{"amount": 100.0}],
+            ]
+
+        async def timeline_transactions(self, _after: str | None = None) -> None:
+            pass
+
+        async def timeline_detail_v2(self, event_id: str) -> None:
+            detail_calls.append(event_id)
+
+        async def compact_portfolio(self) -> None:
+            pass
+
+        async def cash(self) -> None:
+            pass
+
+        async def recv(self) -> tuple[int, str, Any]:
+            return (0, "", self._responses.pop(0))
+
+        async def close(self) -> None:
+            pass
+
+    manager = TRSessionManager(
+        phone_no="+49000000000",
+        pin="0000",
+        session_dir=tmp_path,
+        discord_client=Discord2FAClient(bot_token="bot-token", channel_id="000000000000000001"),
+        card_cutoff_date=datetime(2026, 11, 1, 9, 0, tzinfo=UTC),
+    )
+    events, _ = asyncio.run(manager._fetch_ws_data_async(FakeCardTRApi()))
+    assert detail_calls == ["card-new-1"]
+    new_ev = next(e for e in events if e["id"] == "card-new-1")
+    assert "details" in new_ev
+    old_ev = next(e for e in events if e["id"] == "card-old-1")
+    assert "details" not in old_ev

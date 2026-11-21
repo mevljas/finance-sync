@@ -353,3 +353,92 @@ def test_tr_worker_couchdb_syncs_saveback_as_zero_cost(
     # initial = 985.00 - 10.00 + 0.00 = 975.00
     assert summary.patched_wealth_initial_balance == 975.00
     assert patch_route.call_count == 1
+
+
+@respx.mock
+def test_tr_worker_syncs_card_categories_from_detail_v2_and_normalized_names(
+    test_settings: Settings,
+    dedup_store: DeduplicationStore,
+    tmp_path: Path,
+) -> None:
+    """Verify TRWorker resolves card categories via normalized keywords and detail_v2 hints."""
+    from datetime import UTC, datetime
+
+    from tr_worker.session_manager import Discord2FAClient, TRSessionManager
+
+    class StubSessionManager(TRSessionManager):
+        def fetch_timeline_and_portfolio(self) -> tuple[list[dict[str, object]], dict[str, object]]:
+            events: list[dict[str, object]] = [
+                {
+                    "id": "card-dm",
+                    "timestamp": "2026-11-16T10:09:11Z",
+                    "eventType": "card_successful_transaction",
+                    "title": "dm-drogerie",
+                    "subtitle": "Card payment",
+                    "status": "EXECUTED",
+                    "amount": {"value": -11.90, "currency": "EUR"},
+                },
+                {
+                    "id": "card-fresco",
+                    "timestamp": "2026-11-16T10:05:28Z",
+                    "eventType": "card_successful_transaction",
+                    "title": "Restavracija Fresco",
+                    "subtitle": "Card payment",
+                    "status": "EXECUTED",
+                    "amount": {"value": -9.00, "currency": "EUR"},
+                },
+                {
+                    "id": "card-mcc-unknown",
+                    "timestamp": "2026-11-16T12:00:00Z",
+                    "eventType": "card_successful_transaction",
+                    "title": "Mystery Shop 123",
+                    "subtitle": "Card payment",
+                    "status": "EXECUTED",
+                    "amount": {"value": -20.00, "currency": "EUR"},
+                    "details": {
+                        "sections": [
+                            {
+                                "title": "Overview",
+                                "data": [{"title": "MCC", "detail": {"text": "5411"}}],
+                            }
+                        ]
+                    },
+                },
+            ]
+            return events, {"netValue": 0.0, "positions": []}
+
+    dedup_store.set_metadata("tr_backfill_reconciled_v1", "true")
+    respx.get("https://rest.budgetbakers.com/wallet/v1/api/records").mock(
+        return_value=httpx.Response(200, json={"records": []})
+    )
+    post_route = respx.post("https://rest.budgetbakers.com/wallet/v1/api/records").mock(
+        return_value=httpx.Response(
+            200,
+            json={"results": [{"id": f"rec-{i}", "success": True} for i in range(3)]},
+        )
+    )
+
+    sess_mgr = StubSessionManager(
+        phone_no="+49000000000",
+        pin="0000",
+        session_dir=tmp_path,
+        discord_client=Discord2FAClient(bot_token="bot-token", channel_id="000000000000000001"),
+        card_cutoff_date=datetime(2026, 11, 1, 9, 0, tzinfo=UTC),
+    )
+    assert sess_mgr.card_cutoff_date == test_settings.tr_card_cutoff_date
+
+    with BudgetBakersClient(token="test-token") as bb_client:
+        worker = TRWorker(
+            settings=test_settings,
+            db=dedup_store,
+            bb_client=bb_client,
+            session_manager=sess_mgr,
+        )
+        summary = worker.sync_once()
+
+    assert summary.records_created == 3
+    pushed = json.loads(post_route.calls[0].request.content)
+    by_note = {r["note"]: r["categoryId"] for r in pushed}
+    assert by_note["dm-drogerie"] == "5c5c07db-0014-8000-8000-000000000000"
+    assert by_note["Restavracija Fresco"] == "5c5c03e9-000a-8000-8000-000000000000"
+    assert by_note["Mystery Shop 123"] == "5c5c03e8-000a-8000-8000-000000000000"

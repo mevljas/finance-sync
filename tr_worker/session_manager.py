@@ -9,6 +9,7 @@ import logging
 import re
 import time
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -289,6 +290,7 @@ class TRSessionManager:
         *,
         use_mock_data: bool = False,
         tr_api_factory: Callable[..., Any] | None = None,
+        card_cutoff_date: datetime | None = None,
     ) -> None:
         self.phone_no = phone_no
         self.pin = pin
@@ -299,6 +301,7 @@ class TRSessionManager:
         self.discord_client = discord_client
         self.use_mock_data = use_mock_data
         self._tr_api_factory = tr_api_factory
+        self.card_cutoff_date = card_cutoff_date
         self._tr_api: Any = None
 
     def _create_tr_api(self) -> Any:
@@ -458,10 +461,24 @@ class TRSessionManager:
             detail_v2_fn = getattr(api, "timeline_detail_v2", None)
             if callable(detail_v2_fn):
                 for event in timeline_events:
+                    status_u = str(event.get("status") or "EXECUTED").upper()
+                    if status_u in ("CANCELED", "CANCELLED", "FAILED", "REJECTED", "PENDING"):
+                        continue
                     subtitle_l = str(event.get("subtitle") or "").lower()
                     title_l = str(event.get("title") or "").lower()
                     ev_type_l = str(event.get("eventType") or "").lower()
                     combined = f"{ev_type_l} {title_l} {subtitle_l}"
+                    is_card_ev = "card" in combined
+                    if is_card_ev and self.card_cutoff_date is not None:
+                        raw_ts = str(event.get("timestamp") or "").strip()
+                        if raw_ts:
+                            cleaned_ts = f"{raw_ts[:-1]}+00:00" if raw_ts.endswith("Z") else raw_ts
+                            with contextlib.suppress(ValueError):
+                                ev_dt = datetime.fromisoformat(cleaned_ts)
+                                if ev_dt.tzinfo is None:
+                                    ev_dt = ev_dt.replace(tzinfo=UTC)
+                                if ev_dt < self.card_cutoff_date:
+                                    continue
                     needs_detail = any(
                         kw in combined
                         for kw in (
@@ -471,6 +488,7 @@ class TRSessionManager:
                             "order",
                             "buy",
                             "dividend",
+                            "card",
                         )
                     )
                     action: dict[str, Any] = event.get("action") or {}
@@ -479,7 +497,7 @@ class TRSessionManager:
                         needs_detail
                         and ev_id
                         and not event.get("details")
-                        and action.get("type") == "timelineDetail"
+                        and action.get("type") in ("timelineDetail", "timelineDetailV2")
                     ):
                         await detail_v2_fn(ev_id)
                         _, _, detail_resp = await api.recv()

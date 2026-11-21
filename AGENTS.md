@@ -25,6 +25,7 @@ Before modifying code, consult these source-of-truth documents in `docs/`:
   - [`0011-discord-gateway-ready-first-2fa.md`](./docs/adr/0011-discord-gateway-ready-first-2fa.md)
   - [`0012-ibkr-zero-cost-baseline-stock-grants.md`](./docs/adr/0012-ibkr-zero-cost-baseline-stock-grants.md)
   - [`0013-tr-saveback-zero-cost-asset-transactions.md`](./docs/adr/0013-tr-saveback-zero-cost-asset-transactions.md)
+  - [`0014-tr-card-categorization-detail-v2-and-mcc.md`](./docs/adr/0014-tr-card-categorization-detail-v2-and-mcc.md)
 
 ---
 

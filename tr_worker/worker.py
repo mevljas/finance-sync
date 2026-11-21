@@ -84,6 +84,7 @@ class TRWorker:
                 session_dir=settings.tr_session_dir,
                 discord_client=discord_client,
                 use_mock_data=settings.use_mock_data,
+                card_cutoff_date=settings.tr_card_cutoff_date,
             )
         self._owns_couchdb_client = couchdb_client is None and settings.has_couchdb
         if couchdb_client is not None:

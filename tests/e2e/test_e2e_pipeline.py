@@ -410,3 +410,80 @@ def test_e2e_tr_cli_couchdb_saveback_zero_cost_dry_run_report(
     assert tx_docs[saveback_id]["price"] == 0
     assert tx_docs[sparplan_id]["cashAmount"] == 5000
     get_settings.cache_clear()
+
+
+@respx.mock
+def test_e2e_tr_cli_card_categorization_dry_run_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify tr_worker CLI categorizes card expenses via keywords, MCC, and TR icon hints."""
+    from config.settings import CATEGORY_UNKNOWN_EXPENSE
+
+    tr_cash_acc = "00000000-0000-0000-0000-000000000002"
+    tr_wealth_acc = "00000000-0000-0000-0000-000000000003"
+    db_file = tmp_path / "tr_cat_e2e.db"
+    report_file = tmp_path / "tr_cat_preview.json"
+
+    monkeypatch.setenv("USE_MOCK_DATA", "false")
+    monkeypatch.setenv("DRY_RUN", "false")
+    monkeypatch.setenv("SQLITE_DB_PATH", str(db_file))
+    monkeypatch.setenv("BUDGETBAKERS_TOKEN", "e2e-jwt-token")
+    monkeypatch.setenv("BB_TR_CASH_ACCOUNT_ID", tr_cash_acc)
+    monkeypatch.setenv("BB_TR_WEALTH_ACCOUNT_ID", tr_wealth_acc)
+    monkeypatch.setenv("TR_SESSION_DIR", str(tmp_path / "tr_sess"))
+    get_settings.cache_clear()
+
+    sample_events = [
+        {
+            "id": "card-1",
+            "timestamp": "2026-11-16T10:09:11Z",
+            "eventType": "card_successful_transaction",
+            "title": "dm-drogerie",
+            "subtitle": "Card payment",
+            "status": "EXECUTED",
+            "amount": {"value": -11.90, "currency": "EUR"},
+        },
+        {
+            "id": "card-2",
+            "timestamp": "2026-11-16T10:05:28Z",
+            "eventType": "card_successful_transaction",
+            "title": "Restavracija Fresco",
+            "subtitle": "Card payment",
+            "status": "EXECUTED",
+            "amount": {"value": -9.00, "currency": "EUR"},
+        },
+        {
+            "id": "card-3",
+            "timestamp": "2026-11-16T12:00:00Z",
+            "eventType": "card_successful_transaction",
+            "title": "Unknown Bistro",
+            "subtitle": "Card payment",
+            "icon": "logos/merchant-fallback-restaurants/v2",
+            "status": "EXECUTED",
+            "amount": {"value": -14.00, "currency": "EUR"},
+        },
+    ]
+    monkeypatch.setattr(
+        "tr_worker.session_manager.TRSessionManager.fetch_timeline_and_portfolio",
+        lambda _self: (sample_events, {"netValue": 0.0, "positions": []}),
+    )
+
+    wallet = StatefulWalletMock(
+        "00000000-0000-0000-0000-000000000001",
+        tr_cash_acc,
+        tr_wealth_acc,
+    )
+    respx.get("https://rest.budgetbakers.com/wallet/v1/api/accounts").mock(
+        side_effect=wallet.handle_get_accounts
+    )
+    respx.get("https://rest.budgetbakers.com/wallet/v1/api/records").mock(
+        side_effect=wallet.handle_get_records
+    )
+
+    assert tr_main(["--once", "--dry-run", "--dry-run-output", str(report_file)]) == 0
+    report = json.loads(report_file.read_text(encoding="utf-8"))
+    created = report["would_create_records"]
+    assert len(created) == 3
+    assert all(rec["categoryId"] != CATEGORY_UNKNOWN_EXPENSE for rec in created)
+    get_settings.cache_clear()

@@ -60,6 +60,97 @@ def _format_iso_utc(dt: datetime) -> str:
 
 
 _ISIN_RE = re.compile(r"\b([A-Z]{2}[A-Z0-9]{10})\b")
+_MCC_RE = re.compile(r"\b(\d{4})\b")
+_MERCHANT_FALLBACK_ICON_RE = re.compile(
+    r"merchant[-_]fallback[-_]([a-z0-9_-]+)",
+    re.IGNORECASE,
+)
+
+
+def _collect_all_sections(event: dict[str, Any]) -> list[dict[str, Any]]:
+    """Collect top-level and nested timelineDetailV2 section dicts from a TR event."""
+    details: dict[str, Any] = event.get("details") or {}
+    sections = list(event.get("sections") or details.get("sections") or [])
+    all_sections: list[dict[str, Any]] = []
+    for sec in sections:
+        if isinstance(sec, dict):
+            all_sections.append(sec)
+            data_items = sec.get("data")
+            if not isinstance(data_items, list):
+                continue
+            for item in data_items:
+                if isinstance(item, dict):
+                    nested = (
+                        (item.get("detail") or {})
+                        .get("action", {})
+                        .get("payload", {})
+                        .get("sections", [])
+                    )
+                    for nsec in nested:
+                        if isinstance(nsec, dict):
+                            all_sections.append(nsec)
+    return all_sections
+
+
+def _icon_to_str(icon_val: Any) -> str:
+    if isinstance(icon_val, dict):
+        return str(icon_val.get("asset") or "")
+    return str(icon_val or "")
+
+
+def _extract_card_category_hints(event: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Extract (mcc, tr_hint) from top-level fields, fallback icon URIs, and timelineDetailV2."""
+    details: dict[str, Any] = event.get("details") or {}
+    mcc: str | None = None
+    tr_hint: str | None = None
+
+    for raw_mcc in (event.get("mcc"), details.get("mcc")):
+        if raw_mcc is not None:
+            m = _MCC_RE.search(str(raw_mcc))
+            if m:
+                mcc = m.group(1)
+                break
+
+    for raw_cat in (event.get("category"), details.get("category")):
+        if isinstance(raw_cat, str) and raw_cat.strip():
+            tr_hint = raw_cat.strip()
+            break
+
+    icon_candidates = [_icon_to_str(event.get("icon"))]
+    all_sections = _collect_all_sections(event)
+    for section in all_sections:
+        if section.get("type") == "header":
+            data_obj = section.get("data")
+            if isinstance(data_obj, dict):
+                icon_candidates.append(_icon_to_str(data_obj.get("icon")))
+        data_list = section.get("data")
+        if not isinstance(data_list, list):
+            continue
+        for item in data_list:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("title") or "").strip().lower()
+            detail_obj: dict[str, Any] = item.get("detail") or {}
+            detail_text = str(detail_obj.get("text") or "").strip()
+            if not detail_text:
+                continue
+            if mcc is None and ("mcc" in label or "merchant category code" in label):
+                m = _MCC_RE.search(detail_text)
+                if m:
+                    mcc = m.group(1)
+            elif tr_hint is None and any(
+                k in label for k in ("category", "kategorie", "kategorija")
+            ):
+                tr_hint = detail_text
+
+    if tr_hint is None:
+        for icon_str in icon_candidates:
+            m_icon = _MERCHANT_FALLBACK_ICON_RE.search(icon_str)
+            if m_icon:
+                tr_hint = m_icon.group(1)
+                break
+
+    return mcc, tr_hint
 
 
 def _parse_localized_decimal(text: str) -> Decimal | None:
@@ -98,22 +189,7 @@ def _extract_trade_details(event: dict[str, Any]) -> tuple[str, str, Decimal, De
             isin = m.group(1)
 
     # 2. Walk top-level and nested timelineDetailV2 sections
-    sections = list(event.get("sections") or details.get("sections") or [])
-    all_sections: list[dict[str, Any]] = []
-    for sec in sections:
-        if isinstance(sec, dict):
-            all_sections.append(sec)
-            for item in sec.get("data", []):
-                if isinstance(item, dict):
-                    nested = (
-                        (item.get("detail") or {})
-                        .get("action", {})
-                        .get("payload", {})
-                        .get("sections", [])
-                    )
-                    for nsec in nested:
-                        if isinstance(nsec, dict):
-                            all_sections.append(nsec)
+    all_sections = _collect_all_sections(event)
 
     for section in all_sections:
         action = section.get("action")
@@ -406,8 +482,12 @@ def parse_tr_timeline_events(
             if event_dt < settings.tr_card_cutoff_date:
                 continue
             expense_amount = -round(abs(raw_amount), 2)
-            mcc = str(event.get("mcc") or "").strip() or None
-            category_id = settings.resolve_merchant_category(title, mcc=mcc)
+            mcc, tr_hint = _extract_card_category_hints(event)
+            category_id = settings.resolve_merchant_category(
+                title,
+                mcc=mcc,
+                tr_hint=tr_hint,
+            )
             parsed.append(
                 ParsedTRRecord(
                     external_id=event_id,
