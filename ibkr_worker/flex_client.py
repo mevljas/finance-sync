@@ -130,6 +130,26 @@ def _enum_name(value: Any) -> str:
     return str(value)
 
 
+def _resolve_fx_rate_to_base(
+    raw_fx_value: object,
+    currency: str,
+    timestamp: str,
+    date_fx_rates: dict[tuple[str, str], tuple[Decimal, Decimal]],
+    stmt_fx_rates: dict[str, Decimal],
+) -> Decimal:
+    """Return explicit fxRateToBase or fall back to same-date CASH FX / statement rate."""
+    explicit_fx = _to_decimal(raw_fx_value, default="0")
+    if explicit_fx > Decimal("0"):
+        return explicit_fx
+    clean_ccy = currency.strip().upper() or "EUR"
+    if clean_ccy == "EUR":
+        return Decimal("1")
+    date_entry = date_fx_rates.get((clean_ccy, timestamp[:10]))
+    if date_entry is not None:
+        return date_entry[1]
+    return stmt_fx_rates.get(clean_ccy, Decimal("1"))
+
+
 def parse_flex_xml(xml_bytes: bytes) -> IBKRStatementData:
     """Parse IBKR Activity Flex Query XML using ibflex2 into IBKRStatementData."""
     try:
@@ -157,67 +177,10 @@ def parse_flex_xml(xml_bytes: bytes) -> IBKRStatementData:
             to_date = max(to_date, stmt_to_date)
 
         stmt_fx_rates: dict[str, Decimal] = {"EUR": Decimal("1")}
+        # (currency, YYYY-MM-DD) -> (largest abs FX quantity on that date, EUR-per-CCY rate)
+        date_fx_rates: dict[tuple[str, str], tuple[Decimal, Decimal]] = {}
 
-        # 1. Parse Trades (skip internal CASH FX conversions and zero-cash entries)
-        for trade in getattr(stmt, "Trades", ()):
-            asset_cat = _enum_name(getattr(trade, "assetCategory", "")).upper()
-            if asset_cat == "CASH":
-                sym_str = str(getattr(trade, "symbol", "") or "").strip().upper()
-                tr_price = _to_decimal(getattr(trade, "tradePrice", None))
-                if sym_str.startswith("EUR.") and tr_price > Decimal("0"):
-                    stmt_fx_rates.setdefault(
-                        sym_str.split(".", 1)[1],
-                        Decimal("1") / tr_price,
-                    )
-                continue
-            symbol = str(getattr(trade, "symbol", "") or "").strip()
-            isin = str(
-                getattr(trade, "isin", None) or getattr(trade, "securityID", None) or symbol
-            ).strip()
-            side_raw = _enum_name(getattr(trade, "buySell", "BUY")).upper()
-            side = "SELL" if "SELL" in side_raw else "BUY"
-            quantity = abs(_to_decimal(getattr(trade, "quantity", 0)))
-            price = _to_decimal(getattr(trade, "tradePrice", 0))
-            net_cash = _to_decimal(getattr(trade, "netCash", None))
-            if net_cash == Decimal("0"):
-                proceeds = _to_decimal(getattr(trade, "proceeds", 0))
-                commission = _to_decimal(getattr(trade, "ibCommission", 0))
-                net_cash = proceeds + commission
-            if net_cash.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) == Decimal("0.00"):
-                continue
-            if side == "BUY" and net_cash > Decimal("0"):
-                net_cash = -net_cash
-            elif side == "SELL" and net_cash < Decimal("0"):
-                net_cash = abs(net_cash)
-
-            trade_id = str(
-                getattr(trade, "tradeID", None)
-                or getattr(trade, "transactionID", None)
-                or f"{symbol}-{getattr(trade, 'dateTime', '')}"
-            )
-            dt_val = getattr(trade, "dateTime", None) or getattr(trade, "tradeDate", None)
-            timestamp = _format_iso_timestamp(dt_val)
-            currency = str(getattr(trade, "currency", "EUR") or "EUR")
-            fx_rate_trade = _to_decimal(getattr(trade, "fxRateToBase", None), default="1")
-            if fx_rate_trade <= Decimal("0"):
-                fx_rate_trade = Decimal("1")
-
-            trades.append(
-                IBKRTradeEvent(
-                    trade_id=trade_id,
-                    symbol=symbol,
-                    isin=isin,
-                    side=side,
-                    quantity=quantity,
-                    price=price,
-                    net_cash=net_cash,
-                    currency=currency,
-                    timestamp=timestamp,
-                    fx_rate_to_base=fx_rate_trade,
-                )
-            )
-
-        # 2. Parse OpenPositions market value first so fxRateToBase rates are known
+        # 1. Parse OpenPositions first so statement-level fxRateToBase rates are known
         for pos in getattr(stmt, "OpenPositions", ()):
             pos_symbol = str(getattr(pos, "symbol", "") or "").strip()
             pos_isin = str(
@@ -253,7 +216,82 @@ def parse_flex_xml(xml_bytes: bytes) -> IBKRStatementData:
             pos_val *= fx_rate
             open_positions_value += pos_val
 
-        # 3. Parse CashTransactions (Dividends & Interest; skip Deposits/Withdrawals)
+        # 2. Index internal CASH FX conversions before parsing security Trades
+        stmt_trades = list(getattr(stmt, "Trades", ()))
+        for trade in stmt_trades:
+            asset_cat = _enum_name(getattr(trade, "assetCategory", "")).upper()
+            if asset_cat != "CASH":
+                continue
+            sym_str = str(getattr(trade, "symbol", "") or "").strip().upper()
+            tr_price = _to_decimal(getattr(trade, "tradePrice", None))
+            if sym_str.startswith("EUR.") and tr_price > Decimal("0"):
+                fx_ccy = sym_str.split(".", 1)[1]
+                rate = Decimal("1") / tr_price
+                stmt_fx_rates.setdefault(fx_ccy, rate)
+                dt_val = getattr(trade, "dateTime", None) or getattr(trade, "tradeDate", None)
+                fx_date = _format_iso_timestamp(dt_val)[:10]
+                fx_size = abs(_to_decimal(getattr(trade, "quantity", 0)))
+                prev_entry = date_fx_rates.get((fx_ccy, fx_date))
+                if prev_entry is None or fx_size > prev_entry[0]:
+                    date_fx_rates[(fx_ccy, fx_date)] = (fx_size, rate)
+
+        # 3. Parse security Trades (skip internal CASH FX conversions and zero-cash entries)
+        for trade in stmt_trades:
+            asset_cat = _enum_name(getattr(trade, "assetCategory", "")).upper()
+            if asset_cat == "CASH":
+                continue
+            symbol = str(getattr(trade, "symbol", "") or "").strip()
+            isin = str(
+                getattr(trade, "isin", None) or getattr(trade, "securityID", None) or symbol
+            ).strip()
+            side_raw = _enum_name(getattr(trade, "buySell", "BUY")).upper()
+            side = "SELL" if "SELL" in side_raw else "BUY"
+            quantity = abs(_to_decimal(getattr(trade, "quantity", 0)))
+            price = _to_decimal(getattr(trade, "tradePrice", 0))
+            net_cash = _to_decimal(getattr(trade, "netCash", None))
+            if net_cash == Decimal("0"):
+                proceeds = _to_decimal(getattr(trade, "proceeds", 0))
+                commission = _to_decimal(getattr(trade, "ibCommission", 0))
+                net_cash = proceeds + commission
+            if net_cash.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) == Decimal("0.00"):
+                continue
+            if side == "BUY" and net_cash > Decimal("0"):
+                net_cash = -net_cash
+            elif side == "SELL" and net_cash < Decimal("0"):
+                net_cash = abs(net_cash)
+
+            trade_id = str(
+                getattr(trade, "tradeID", None)
+                or getattr(trade, "transactionID", None)
+                or f"{symbol}-{getattr(trade, 'dateTime', '')}"
+            )
+            dt_val = getattr(trade, "dateTime", None) or getattr(trade, "tradeDate", None)
+            timestamp = _format_iso_timestamp(dt_val)
+            currency = str(getattr(trade, "currency", "EUR") or "EUR").upper()
+            fx_rate_trade = _resolve_fx_rate_to_base(
+                getattr(trade, "fxRateToBase", None),
+                currency,
+                timestamp,
+                date_fx_rates,
+                stmt_fx_rates,
+            )
+
+            trades.append(
+                IBKRTradeEvent(
+                    trade_id=trade_id,
+                    symbol=symbol,
+                    isin=isin,
+                    side=side,
+                    quantity=quantity,
+                    price=price,
+                    net_cash=net_cash,
+                    currency=currency,
+                    timestamp=timestamp,
+                    fx_rate_to_base=fx_rate_trade,
+                )
+            )
+
+        # 4. Parse CashTransactions (Dividends & Interest; skip Deposits/Withdrawals)
         for cash_tx in getattr(stmt, "CashTransactions", ()):
             tx_type = _enum_name(getattr(cash_tx, "type", "")).lower()
             if "deposit" in tx_type or "withdrawal" in tx_type:
@@ -271,9 +309,12 @@ def parse_flex_xml(xml_bytes: bytes) -> IBKRStatementData:
             dt_val = getattr(cash_tx, "dateTime", None) or getattr(cash_tx, "reportDate", None)
             timestamp = _format_iso_timestamp(dt_val)
             currency = str(getattr(cash_tx, "currency", "EUR") or "EUR").upper()
-            raw_fx = _to_decimal(getattr(cash_tx, "fxRateToBase", None), default="0")
-            fx_rate_cash = (
-                raw_fx if raw_fx > Decimal("0") else stmt_fx_rates.get(currency, Decimal("1"))
+            fx_rate_cash = _resolve_fx_rate_to_base(
+                getattr(cash_tx, "fxRateToBase", None),
+                currency,
+                timestamp,
+                date_fx_rates,
+                stmt_fx_rates,
             )
 
             cash_events.append(
@@ -290,14 +331,14 @@ def parse_flex_xml(xml_bytes: bytes) -> IBKRStatementData:
                 )
             )
 
-        # 4. Parse CashReport ending cash
+        # 5. Parse CashReport trade-date ending cash (aligned with trade-date OpenPositions/Trades)
         for cash_rep in getattr(stmt, "CashReport", ()):
             ccy = str(getattr(cash_rep, "currency", "") or "")
             if ccy in ("BASE_SUMMARY", "EUR") or ending_cash == Decimal("0.00"):
-                ending_cash = _to_decimal(
-                    getattr(cash_rep, "endingSettledCash", None)
-                    or getattr(cash_rep, "endingCash", 0)
-                )
+                raw_ending_cash = getattr(cash_rep, "endingCash", None)
+                if raw_ending_cash is None:
+                    raw_ending_cash = getattr(cash_rep, "endingSettledCash", None)
+                ending_cash = _to_decimal(raw_ending_cash, default="0")
                 if ccy == "BASE_SUMMARY":
                     break
 

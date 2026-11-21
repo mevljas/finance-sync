@@ -291,3 +291,109 @@ def test_merge_statement_data_deduplicates_and_uses_latest_positions(
         ]
     )
     assert exit_code == 0
+
+
+def test_parse_flex_xml_prefers_trade_date_ending_cash_over_settled_cash() -> None:
+    """Verify ending_cash uses trade-date endingCash (including zero) with settled fallback."""
+    unsettled_xml = (
+        b'<FlexQueryResponse queryName="ActivityFlexQuery" type="AF">\n'
+        b'  <FlexStatements count="1">\n'
+        b'    <FlexStatement accountId="DU0000000" fromDate="2026-10-22" toDate="2026-11-20"\n'
+        b'                   period="Last30CalendarDays" whenGenerated="2026-11-21;03:00:00">\n'
+        b"      <CashReport>\n"
+        b'        <CashReportCurrency accountId="DU0000000" currency="BASE_SUMMARY"\n'
+        b'                            endingCash="2490.877375832"\n'
+        b'                            endingSettledCash="17579.177375832" />\n'
+        b"      </CashReport>\n"
+        b"    </FlexStatement>\n"
+        b"  </FlexStatements>\n"
+        b"</FlexQueryResponse>"
+    )
+    assert parse_flex_xml(unsettled_xml).ending_cash == Decimal("2490.88")
+
+    zero_cash_xml = (
+        b'<FlexQueryResponse queryName="ActivityFlexQuery" type="AF">\n'
+        b'  <FlexStatements count="1">\n'
+        b'    <FlexStatement accountId="DU0000000" fromDate="2026-10-22" toDate="2026-11-20"\n'
+        b'                   period="Last30CalendarDays" whenGenerated="2026-11-21;03:00:00">\n'
+        b"      <CashReport>\n"
+        b'        <CashReportCurrency accountId="DU0000000" currency="BASE_SUMMARY"\n'
+        b'                            endingCash="0"\n'
+        b'                            endingSettledCash="500.00" />\n'
+        b"      </CashReport>\n"
+        b"    </FlexStatement>\n"
+        b"  </FlexStatements>\n"
+        b"</FlexQueryResponse>"
+    )
+    assert parse_flex_xml(zero_cash_xml).ending_cash == Decimal("0.00")
+
+    settled_fallback_xml = (
+        b'<FlexQueryResponse queryName="ActivityFlexQuery" type="AF">\n'
+        b'  <FlexStatements count="1">\n'
+        b'    <FlexStatement accountId="DU0000000" fromDate="2026-10-22" toDate="2026-11-20"\n'
+        b'                   period="Last30CalendarDays" whenGenerated="2026-11-21;03:00:00">\n'
+        b"      <CashReport>\n"
+        b'        <CashReportCurrency accountId="DU0000000" currency="BASE_SUMMARY"\n'
+        b'                            endingSettledCash="123.45" />\n'
+        b"      </CashReport>\n"
+        b"    </FlexStatement>\n"
+        b"  </FlexStatements>\n"
+        b"</FlexQueryResponse>"
+    )
+    assert parse_flex_xml(settled_fallback_xml).ending_cash == Decimal("123.45")
+
+
+def test_parse_flex_xml_resolves_missing_trade_fx_rate_from_cash_fx_and_open_positions() -> None:
+    """Verify foreign trades without fxRateToBase use same-day CASH FX or OpenPositions rate."""
+    xml_bytes = (
+        b'<FlexQueryResponse queryName="ActivityFlexQuery" type="AF">\n'
+        b'  <FlexStatements count="1">\n'
+        b'    <FlexStatement accountId="DU0000000" fromDate="2026-10-22" toDate="2026-11-20"\n'
+        b'                   period="Last30CalendarDays" whenGenerated="2026-11-21;03:00:00">\n'
+        b"      <CashReport>\n"
+        b'        <CashReportCurrency accountId="DU0000000" currency="BASE_SUMMARY"\n'
+        b'                            endingCash="100.00" endingSettledCash="100.00" />\n'
+        b"      </CashReport>\n"
+        b"      <OpenPositions>\n"
+        b'        <OpenPosition accountId="DU0000000" assetCategory="STK" symbol="FAKEUSD"\n'
+        b'                      isin="US0000000001" currency="USD" fxRateToBase="0.91"\n'
+        b'                      position="6" markPrice="200.00" positionValue="1200.00" />\n'
+        b"      </OpenPositions>\n"
+        b"      <Trades>\n"
+        b'        <Trade accountId="DU0000000" assetCategory="STK" symbol="FAKEUSD"\n'
+        b'               isin="US0000000001" currency="USD" tradeID="TRD-FX-1"\n'
+        b'               dateTime="20261030;09:39:39" tradeDate="20261030"\n'
+        b'               buySell="BUY" quantity="4" tradePrice="280.00"\n'
+        b'               netCash="-1120.00" proceeds="-1120.00" ibCommission="0" />\n'
+        b'        <Trade accountId="DU0000000" assetCategory="STK" symbol="FAKEUSD"\n'
+        b'               isin="US0000000001" currency="USD" tradeID="TRD-FX-2"\n'
+        b'               dateTime="20261105;10:00:00" tradeDate="20261105"\n'
+        b'               buySell="BUY" quantity="1" tradePrice="200.00"\n'
+        b'               netCash="-200.00" proceeds="-200.00" ibCommission="0" />\n'
+        b'        <Trade accountId="DU0000000" assetCategory="STK" symbol="FAKEUSD"\n'
+        b'               isin="US0000000001" currency="USD" tradeID="TRD-FX-3"\n'
+        b'               dateTime="20261110;10:00:00" tradeDate="20261110"\n'
+        b'               buySell="BUY" quantity="1" tradePrice="200.00"\n'
+        b'               netCash="-200.00" proceeds="-200.00" ibCommission="0"\n'
+        b'               fxRateToBase="0.88" />\n'
+        b'        <Trade accountId="DU0000000" assetCategory="CASH" symbol="EUR.USD"\n'
+        b'               isin="" securityID="" currency="USD" tradeID="TRD-CASH-SMALL"\n'
+        b'               dateTime="20261030;17:00:00" tradeDate="20261030"\n'
+        b'               buySell="BUY" quantity="0.01" tradePrice="1.25"\n'
+        b'               netCash="0" proceeds="-0.0125" ibCommission="0" />\n'
+        b'        <Trade accountId="DU0000000" assetCategory="CASH" symbol="EUR.USD"\n'
+        b'               isin="" securityID="" currency="USD" tradeID="TRD-CASH-MAIN"\n'
+        b'               dateTime="20261030;09:39:40" tradeDate="20261030"\n'
+        b'               buySell="SELL" quantity="-1000.00" tradePrice="1.12"\n'
+        b'               netCash="0" proceeds="1120.00" ibCommission="0" />\n'
+        b"      </Trades>\n"
+        b"    </FlexStatement>\n"
+        b"  </FlexStatements>\n"
+        b"</FlexQueryResponse>"
+    )
+
+    stmt = parse_flex_xml(xml_bytes)
+    by_id = {t.trade_id: t for t in stmt.trades}
+    assert by_id["TRD-FX-1"].fx_rate_to_base == Decimal("1") / Decimal("1.12")
+    assert by_id["TRD-FX-2"].fx_rate_to_base == Decimal("0.91")
+    assert by_id["TRD-FX-3"].fx_rate_to_base == Decimal("0.88")

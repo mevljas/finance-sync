@@ -29,7 +29,7 @@ Additionally, for Trade Republic Savings Plans, the outgoing cash deduction on `
 
 3. **Uninvested Cash Balance Reconciliation**:
    - BudgetBakers Wallet's web/mobile UI computes an investment account's cash balance by subtracting all CouchDB `BUY` `-AssetTransaction.cashAmount` entries (and adding `SELL` entries) from the REST formula (`initial + totalIncomes - totalExpenses`).
-   - Therefore, when `settings.has_couchdb == True`, `PATCH /v1/api/accounts` sets the REST target balance to `uninvested_cash + net_cash_invested_eur` so the displayed Cash balance in Wallet matches live broker settled cash (`ending_cash` for IBKR; `0.00 EUR` for `BB_TR_WEALTH_ACCOUNT_ID`) while Wallet adds live stock value automatically:
+   - Therefore, when `settings.has_couchdb == True`, `PATCH /v1/api/accounts` sets the REST target balance to `uninvested_cash + net_cash_invested_eur` so the displayed Cash balance in Wallet matches live broker cash (`ending_cash` for IBKR — trade-date `endingCash` per [ADR-0014](./0014-ibkr-trade-date-cash-and-fx-fallback.md); `0.00 EUR` for `BB_TR_WEALTH_ACCOUNT_ID`) while Wallet adds live stock value automatically:
      - `BB_IBKR_ACCOUNT_ID`: Reconciled to `statement.ending_cash + net_cash_invested_eur`.
      - `BB_TR_WEALTH_ACCOUNT_ID`: Reconciled to `0.00 EUR + net_cash_invested_eur`.
      - `BB_TR_CASH_ACCOUNT_ID`: Reconciled to live Trade Republic cash balance (`cashBalance` from `api.cash()`) when available.
